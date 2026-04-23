@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 安裝 Playwright Chromium 瀏覽器核心與系統函式庫
 RUN playwright install chromium
 RUN playwright install-deps chromium
-
+RUN playwright install
 # 複製專案程式碼
 COPY main.py .
 

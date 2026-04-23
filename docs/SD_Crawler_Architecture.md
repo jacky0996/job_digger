@@ -1,53 +1,47 @@
 # 職缺挖掘機：系統設計規格書 (Software Design Specification)
 
-## 1. 架構模式：生產者-消費者模型 (Producer-Consumer Pattern)
-為了提升爬蟲效率並降低資料庫 (DB) 壓力，本專案採用基於「非同步記憶體佇列」的並發模型。這允許不同階段的爬蟲任務可以重疊執行，而不需要互相等待。
+## 1. 系統架構：生產者-消費者模式
+本系統核心採用非同步併發架構，將爬取任務拆分為多個獨立運作的階段，以提升擷取效率。
 
-### 角色定義
-*   **Producer (生產者 - Stage A)**: `ListFetcher` 模組。
-    *   負責在 104 搜尋列表頁進行廣度掃描。
-    *   將抓到的初步資料（如職缺 URL, 公司 URL）封裝成訊息，推入 `asyncio.Queue`。
-*   **Buffer (傳輸緩衝)**: `asyncio.Queue`。
-    *   一個執行緒安全 (Thread-safe) 的記憶體佇列。
-    *   作為 A 與 B 階段之間的解耦層。
-*   **Consumer (消費者 - Stage B)**: `CompanyDetailer` 模組。
-    *   持續監測 Queue。一旦有資料進入，立即啟動另一組瀏覽器行為前往公司分頁抓取資本額。
-    *   處理完後將資料傳遞給 Collector。
-*   **Collector & Committer (收集與寫入 - Stage C)**:
-    *   收集所有階段完成的最終資料。
-    *   累積到一定數量後執行 **「批次寫入 (Batch Insert)」**。
+### 階段職責定義
+*   **探測階段 (Initialization & Probing)**:
+    *   初始化瀏覽器環境並分析目標搜尋條件。
+    *   評估當前任務的總規模（總頁數與總筆數），提供任務進度評估基準。
+*   **生產者 (Producer - List Fetcher)**:
+    *   負責廣度爬取。遍歷搜尋分頁並擷取初步職缺物件。
+    *   執行網頁滾動與分頁導航邏輯，確保動態內容完整載入。
+    *   將擷取到的初步資訊封裝為任務訊息後，推入非同步記憶體佇列 (Task Queue)。
+*   **消費者 (Consumer - Detail Extractor)**:
+    *   負責深度爬取。訂閱 Task Queue 並提取職缺訊息。
+    *   執行進階數據擷取 (如：深度訪問公司頁面以獲取資本額等隱藏欄位)。
+*   **數據整合與持久化 (Data Aggregator & Persistence)**:
+    *   負責將多階段採集的資料進行清洗、格式化處理。
+    *   執行批次寫入 (Batch Insert) 至資料庫，確保數據一致性並優化資料庫效能。
 
-## 2. 系統元件時序圖 (UML Sequence Diagram)
+## 2. 數據流時序圖 (UML Sequence Diagram)
 
 ```mermaid
 sequenceDiagram
-    participant A as Stage A (List Fetcher)
-    participant Q as Memory Queue (asyncio)
-    participant B as Stage B (Company Detailer)
-    participant DB as MySQL Database
+    participant Main as Master Controller
+    participant P as Producer (List Fetcher)
+    participant Q as Task Queue
+    participant C as Consumer (Detail Extractor)
 
-    Note over A: 開始爬取列表 (Page 1)
-    A->>Q: 推入職缺物件 (Job A, B, C)
-    Note over B: 偵測到 Queue 有資料流
-    Q->>B: 提取 Job A
-    B->>B: 深度挖掘：爬取公司 A 資本額
-    A->>Q: 推入職缺物件 (Job D, E) (頁面翻頁)
-    Q->>B: 提取 Job B
-    B->>B: 深度挖掘：爬取公司 B 資本額
-    
-    Note over A,B: ... A (廣度) 與 B (深度) 非同步並發執行 ...
-    
-    B->>DB: [Stage C] 任務全數結束，批次寫入資料庫
+    Main->>Main: 執行環境初始化與總量探測
+    Main->>P: 賦予任務區間 (Page 1 to End)
+    loop 分頁採集
+        P->>P: 執行清單擷取與解析
+        P->>Q: 推送職缺 Meta Data
+        Note over Q: 非同步佇列緩衝
+        Q->>C: 提取職缺訊息
+        C->>C: 執行深度細節挖掘
+    end
+    Note over C: 所有任務處理完畢
+    C->>Main: 彙整完整數據集
+    Main->>Main: 啟動資料清理與批次入庫
 ```
 
-## 3. 技術優勢與設計考量
-*   **非阻塞 I/O (Non-blocking I/O)**: 
-    不需等待所有的職缺列表都抓完才開始抓公司詳情。當清單抓到第 2 頁時，第 1 頁的公司詳情可能已經處理完畢，大幅縮短總作業時間。
-*   **DB 寫入效能**: 
-    透過批次寫入 (Batch insert) 降低資料庫連線次數與索引更新壓力。
-*   **解耦 (Decoupling)**: 
-    Stage A 不需要知道 Stage B 是如何運行的，雙方只透過預定義的資料格式進行通訊。
-
-## 4. 異常處理 (Exception Handling)
-*   **斷網重試**: 針對 Playwright 的導覽失敗需實作 Retry 機制。
-*   **優雅退出**: 使用 `Queue.join()` 確保所有傳輸內的職缺都處理完畢後，再啟動最後的 DB 寫入與資源釋放。
+## 3. 技術設計原則
+*   **單一職責原則 (SRP)**: 每個模組專注於特定路徑的擷取或處理，降低代碼耦合。
+*   **並發優化**: 透過 Python asyncio 機制平行化網路請求，極大化資源利用率。
+*   **容錯機制**: 各階段應具備基礎的錯誤攔截與日誌記錄，不應因單筆資料錯誤導致整體管線崩潰。

@@ -1,3 +1,11 @@
 fastapi
 uvicorn
 playwright
+python-dotenv
+# Testing & Linting
+pytest
+pytest-asyncio
+black
+flake8
+isort
+pre-commit
