@@ -1,47 +1,50 @@
-# 職缺挖掘機：系統設計規格書 (Software Design Specification)
+# 104 Job Digger - 系統架構設計 (SD)
 
-## 1. 系統架構：生產者-消費者模式
-本系統核心採用非同步併發架構，將爬取任務拆分為多個獨立運作的階段，以提升擷取效率。
+## 1. 系統概述
+本系統旨在高效採集 104 人力銀行之職缺數據，並透過公司資本額、職稱關鍵字等維度，協助求職者精準篩選高品質職缺。
 
-### 階段職責定義
-*   **探測階段 (Initialization & Probing)**:
-    *   初始化瀏覽器環境並分析目標搜尋條件。
-    *   評估當前任務的總規模（總頁數與總筆數），提供任務進度評估基準。
-*   **生產者 (Producer - List Fetcher)**:
-    *   負責廣度爬取。遍歷搜尋分頁並擷取初步職缺物件。
-    *   執行網頁滾動與分頁導航邏輯，確保動態內容完整載入。
-    *   將擷取到的初步資訊封裝為任務訊息後，推入非同步記憶體佇列 (Task Queue)。
-*   **消費者 (Consumer - Detail Extractor)**:
-    *   負責深度爬取。訂閱 Task Queue 並提取職缺訊息。
-    *   執行進階數據擷取 (如：深度訪問公司頁面以獲取資本額等隱藏欄位)。
-*   **數據整合與持久化 (Data Aggregator & Persistence)**:
-    *   負責將多階段採集的資料進行清洗、格式化處理。
-    *   執行批次寫入 (Batch Insert) 至資料庫，確保數據一致性並優化資料庫效能。
+## 2. 技術棧 (Tech Stack)
+- **語言**: Python 3.12+
+- **核心框架**: `asyncio` (非同步協程)
+- **爬蟲引擎**: `Playwright` (支持 JavaScript 渲染之自動化瀏覽器)
+- **資料庫**: `MariaDB` (Docker 部署，Port 3308)
+- **資料庫驅動**: `aiomysql` (非同步 MySQL 客戶端)
+- **程式碼規範**: `Black`, `Flake8`, `isort`
+- **CI/CD**: GitHub Actions + Pre-commit hooks
 
-## 2. 數據流時序圖 (UML Sequence Diagram)
+## 3. 核心架構：生產者-消費者模型 (Producer-Consumer)
+系統採用解耦的非同步隊列架構，確保爬取與寫入互不干擾。
 
-```mermaid
-sequenceDiagram
-    participant Main as Master Controller
-    participant P as Producer (List Fetcher)
-    participant Q as Task Queue
-    participant C as Consumer (Detail Extractor)
+### 3.1 生產者 (Producer - Stage A)
+- **職責**: 執行網頁跳轉、模擬捲動、分頁偵測與 HTML 數據提取。
+- **擷取策略**:
+    - 使用 `page.evaluate` 執行瀏覽器端 JavaScript 批次擷取。
+    - **錨點回溯法**: 以 `.info-job__text` 為起點，動態向上尋找最近的職缺卡片容器。
+    - **精準過濾**: 根據標題關鍵字（如：php, 後端）進行第一道數據清洗。
 
-    Main->>Main: 執行環境初始化與總量探測
-    Main->>P: 賦予任務區間 (Page 1 to End)
-    loop 分頁採集
-        P->>P: 執行清單擷取與解析
-        P->>Q: 推送職缺 Meta Data
-        Note over Q: 非同步佇列緩衝
-        Q->>C: 提取職缺訊息
-        C->>C: 執行深度細節挖掘
-    end
-    Note over C: 所有任務處理完畢
-    C->>Main: 彙整完整數據集
-    Main->>Main: 啟動資料清理與批次入庫
-```
+### 3.2 訊息隊列 (Async Queue)
+- **媒介**: `asyncio.Queue`
+- **功能**: 作為緩衝帶，平衡爬蟲抓取速度（受網速、反爬機制限制）與資料庫寫入速度。
 
-## 3. 技術設計原則
-*   **單一職責原則 (SRP)**: 每個模組專注於特定路徑的擷取或處理，降低代碼耦合。
-*   **並發優化**: 透過 Python asyncio 機制平行化網路請求，極大化資源利用率。
-*   **容錯機制**: 各階段應具備基礎的錯誤攔截與日誌記錄，不應因單筆資料錯誤導致整體管線崩潰。
+### 3.3 消費者 (Consumer - Stage B/C)
+- **職責**: 從隊列讀取數據並寫入 MariaDB。
+- **並行設計**: 同時啟動 **3 個並行 Worker**，處理高併發寫入需求。
+- **寫入邏輯**:
+    - 採用 **UPSERT (ON DUPLICATE KEY UPDATE)** 語法。
+    - 以 `job_link` 為唯一鍵，若職缺已存在則更新狀態位而不重複插入。
+
+## 4. 資料流程 (Data Flow)
+1. **Init**: 偵測關鍵字搜尋結果的總頁數。
+2. **Loop**:
+    - Producer 載入第 N 頁 -> 捲動觸發渲染 -> JS 批次抓取 -> 放入 Queue。
+    - Consumers 競爭 Queue 中的數據 -> 格式化網址 -> 寫入資料庫。
+3. **Finish**: 傳送結束信號，關閉資料庫與瀏覽器連線。
+
+## 5. 資料結構 (Database Schema)
+- `vacancies`: 存儲職缺主表，包含職稱、公司、連結、公司資本額、薪資內容。
+- `search_configs`: 存儲關鍵字搜尋配置與二次過濾標籤。
+
+## 6. 後續擴展 (Roadmap)
+- **Stage B (Company Deep Dive)**: 針對已採集職缺，進入公司頁面爬取資本額等商業資訊。
+- **Redis Integration**: 導入 Redis 作為任務排程與即時狀態同步伺服器。
+- **API Wrapper**: 使用 FastAPI 提供外部介面觸發同步任務。

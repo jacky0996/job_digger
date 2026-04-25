@@ -13,12 +13,18 @@ services:
       # 為了讓 Python 的 print 能即時顯示在 docker logs 中
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
-    
-  # ==========================================
-  # 未來加入的服務規劃位置 (待補)：
-  # ==========================================
-  # database:
-  #   image: mysql:8.0
-  #   container_name: job_digger_db
-  #   ports:
-  #     - "3308:3306" # 避開你主機已被佔用的 3306
+
+  job_db:
+    image: mariadb:latest
+    container_name: job_digger_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_DATABASE}
+      MYSQL_USER: ${DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "3308:3306"
+    volumes:
+      - ./db_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
