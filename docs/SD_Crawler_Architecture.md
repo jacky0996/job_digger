@@ -33,15 +33,32 @@
     - 採用 **UPSERT (ON DUPLICATE KEY UPDATE)** 語法。
     - 以 `job_link` 為唯一鍵，若職缺已存在則更新狀態位而不重複插入。
 
+### 3.4 公司探查器 (Explorer - Stage B)
+- **職責**: 針對已採集之職缺，補全其所屬公司的詳細商業數據（資本額、員工人數）。
+- **數據補全策略**:
+    - **採集去重**: 透過 SQL `GROUP BY company_link` 確保同一家公司僅點擊一次頁面。
+    - **條件觸發**: 僅針對 `capital = '0'` 或 `employee_count = ''` 的資料行進行工作。
+- **擷取邏輯**:
+    - 前往公司詳情頁。
+    - 遍歷所有 `.intro-table__head` 標籤，比對「資本額」與「員工人數」字樣。
+    - 鎖定該標籤父節點下的 `.t3.mb-0` 內容。
+
 ## 4. 資料流程 (Data Flow)
+### Phase 1: 職缺採集 (Stage A)
 1. **Init**: 偵測關鍵字搜尋結果的總頁數。
 2. **Loop**:
     - Producer 載入第 N 頁 -> 捲動觸發渲染 -> JS 批次抓取 -> 放入 Queue。
-    - Consumers 競爭 Queue 中的數據 -> 格式化網址 -> 寫入資料庫。
-3. **Finish**: 傳送結束信號，關閉資料庫與瀏覽器連線。
+    - Consumers 競爭 Queue 中的數據 -> 格式化網址 -> 寫入資料庫 (UPSERT)。
+
+### Phase 2: 公司探查 (Stage B)
+1. **Fetch**: 從數據庫撈取待補全的公司清單。
+2. **Loop**:
+    - 前往公司頁面 -> JS 擷取商業資訊 (資本、人數) -> 批次更新回資料庫。
 
 ## 5. 資料結構 (Database Schema)
-- `vacancies`: 存儲職缺主表，包含職稱、公司、連結、公司資本額、薪資內容。
+- `vacancies`: 存儲職缺主表。
+    - `capital`: 儲存公司資本額 (VARCHAR，保留單位)。
+    - `employee_count`: 儲存員工人數。
 - `search_configs`: 存儲關鍵字搜尋配置與二次過濾標籤。
 
 ## 6. 後續擴展 (Roadmap)

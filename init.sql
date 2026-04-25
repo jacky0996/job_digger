@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS vacancies (
     company_link TEXT COMMENT '公司 104 頁面連結',
     job_link VARCHAR(500) COMMENT '職缺 104 頁面連結',
     salary_text VARCHAR(100) COMMENT '原始薪資內容',
-    capital BIGINT DEFAULT 0 COMMENT '公司資本額 (由 Stage B 填入)',
+    capital VARCHAR(100) DEFAULT '0' COMMENT '公司資本額 (由 Stage B 填入)',
+    employee_count VARCHAR(100) DEFAULT '' COMMENT '員工人數 (由 Stage B 填入)',
     keyword VARCHAR(50) COMMENT '搜尋關鍵字',
     status ENUM('active', 'closed') DEFAULT 'active' COMMENT '職缺狀態',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '抓取時間',
@@ -22,4 +23,5 @@ CREATE TABLE IF NOT EXISTS search_configs (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='搜尋與過濾配置表';
 
 INSERT INTO search_configs (keyword, filter_tags)
-VALUES ('php', 'php,PHP,軟體,資訊,後端');
+VALUES ('php', 'php,PHP,軟體,資訊,後端')
+ON DUPLICATE KEY UPDATE filter_tags=VALUES(filter_tags);
