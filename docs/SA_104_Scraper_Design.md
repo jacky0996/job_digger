@@ -8,7 +8,7 @@
 graph TD
     Start([開始]) --> ReceiveParams[接收 API 參數: keyword]
     ReceiveParams --> LaunchBrowser[啟動 Playwright 瀏覽器]
-    
+
     subgraph "第一階段：精準搜尋模擬"
         LaunchBrowser --> NavigateHome[前往 104 首頁]
         NavigateHome --> WaitLoad{確認網頁完全載入}
@@ -28,13 +28,13 @@ graph TD
     subgraph "第三階段：資料採集與緩衝並發 (生產者)"
         GetLastPage --> ReturnPage1[回到第一頁]
         ReturnPage1 --> ScrapingLoop{迴圈：Page 1 to LastPage}
-        
+
         ScrapingLoop -- 執行中 --> ScrollDown[向下拖拉至頁面底部]
         ScrollDown --> ExtractData[擷取基礎資料:<br/>公司名稱, 職缺網址,<br/>薪資, 年資, 學歷]
         ExtractData --> BufferQueue[存入待處理佇列 / Buffer]
         BufferQueue --> NextPage[點擊下一頁]
         NextPage --> ScrapingLoop
-        
+
         ScrapingLoop -- 已達末頁 --> EndListScraping[清單採集完畢]
     end
 

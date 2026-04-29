@@ -14,15 +14,11 @@ async def scrape_company_info(page, company_url):
     """
     try:
         print(f"  [Scraper] 正在前往: {company_url}")
-        # 增加超時時間，因為公司頁面有時載入較慢
         await page.goto(company_url, wait_until="load", timeout=30000)
         await page.wait_for_selector(".intro-table__head", timeout=10000)
 
-        # 使用 JS 一次性提取所有表格資訊
         js_logic = """() => {
-            const heads = Array.from(
-                document.querySelectorAll('.intro-table__head')
-            );
+            const heads = Array.from(document.querySelectorAll('.intro-table__head'));
             const res = { capital: '0', employees: '' };
             heads.forEach(h => {
                 const headText = h.innerText;
@@ -42,11 +38,12 @@ async def scrape_company_info(page, company_url):
         return {"capital": "0", "employees": ""}
 
 
-async def run_company_scraper():
+async def run_company_scraper(keyword=None):
     """
-    主排程：從 DB 找出缺少資料的公司並進行採集
+    主排程：從 DB 找出缺少資料的公司並進行採集。可接受動態關鍵字。
     """
-    # 1. 連線資料庫
+    kw = keyword or os.getenv("DEFAULT_KEYWORD", "php")
+
     try:
         conn = await aiomysql.connect(
             host=os.getenv("DB_HOST", "127.0.0.1"),
@@ -56,34 +53,39 @@ async def run_company_scraper():
             db=os.getenv("DB_DATABASE"),
             charset="utf8mb4",
             autocommit=True,
+            init_command="SET time_zone = '+08:00'",
         )
     except Exception as e:
         print(f"[Stage B] ❌ 資料庫連線失敗: {e}")
         return
 
     async with conn.cursor(aiomysql.DictCursor) as cur:
-        # 2. 找出需要補全資料的公司 (以 company_link 分組，避免重複爬取)
-        sql_fetch = """
-        SELECT company_name, company_link
-        FROM vacancies
-        WHERE capital = '0' OR employee_count = ''
-        GROUP BY company_link
-        """
-        await cur.execute(sql_fetch)
+        # 找出需要補全資料的公司 (可選擇只補特定關鍵字的職缺，避免全表掃描過久)
+        sql_fetch = (
+            "SELECT company_name, company_link FROM vacancies "
+            "WHERE keyword = %s AND (capital = '0' OR employee_count = '') "
+            "AND company_link != '' GROUP BY company_link"
+        )
+        await cur.execute(sql_fetch, (kw,))
         companies = await cur.fetchall()
 
         if not companies:
-            print("[Stage B] 🎉 所有公司的資料都已經補齊囉！")
+            print(f"[Stage B] 🎉 '{kw}' 相關公司的資料都已經補齊囉！")
             conn.close()
             return
 
         print(f"[Stage B] 🚀 發現 {len(companies)} 家公司待查...")
 
-        # 3. 啟動瀏覽器
         hl = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=hl)
-            context = await browser.new_context()
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                )
+            )
             page = await context.new_page()
 
             for comp in companies:
@@ -96,7 +98,6 @@ async def run_company_scraper():
                 print(f"[Stage B] 🔍 探查公司: {c_name}")
                 info = await scrape_company_info(page, c_url)
 
-                # 4. 回填資料至資料庫 (根據 company_link 更新)
                 sql_update = """
                 UPDATE vacancies
                 SET capital = %s, employee_count = %s
@@ -108,7 +109,6 @@ async def run_company_scraper():
                 stat = f"資本: {info['capital']}, 人數: {info['employees']}"
                 print(f"  [DB] 更新成功: {c_name} ({stat})")
 
-                # 禮貌爬蟲：短暫休息
                 await asyncio.sleep(2)
 
             await browser.close()

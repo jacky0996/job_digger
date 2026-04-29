@@ -9,7 +9,10 @@ CREATE TABLE IF NOT EXISTS vacancies (
     employee_count VARCHAR(100) DEFAULT '' COMMENT '員工人數 (由 Stage B 填入)',
     keyword VARCHAR(50) COMMENT '搜尋關鍵字',
     status ENUM('active', 'closed') DEFAULT 'active' COMMENT '職缺狀態',
+    check_type VARCHAR(255) DEFAULT NULL COMMENT '篩選結果分類',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '抓取時間',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最後更新時間',
+    deleted_at TIMESTAMP NULL DEFAULT NULL COMMENT '軟刪除時間',
     UNIQUE KEY uk_job_link (job_link),
     INDEX idx_keyword (keyword),
     INDEX idx_status (status)

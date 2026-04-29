@@ -2,12 +2,14 @@ import asyncio
 import os
 import re
 
+import aiomysql
 from dotenv import load_dotenv
+from playwright.async_api import async_playwright
 
 load_dotenv()
 
 
-async def producer(page, total_pages, keyword, queue):
+async def producer(page, total_pages, keyword, queue, filter_tags):
     """
     生產者：負責翻頁、擷取清單資料並推入 Queue
     """
@@ -29,7 +31,7 @@ async def producer(page, total_pages, keyword, queue):
         except Exception:
             print(f"[Producer] ⚠️ 第 {p_num} 頁載入異常，繼續...")
 
-        # 2. 以「職稱標籤」為錨點向上回溯擷取數據
+        # 2. 擷取數據
         js_code = """() => {
             const sels = '.info-job__text';
             const titles = Array.from(document.querySelectorAll(sels));
@@ -41,8 +43,7 @@ async def producer(page, total_pages, keyword, queue):
                        limit < 10) {
                     card = card.parentElement;
                     limit++;
-                    if (card &&
-                        card.classList.contains('job-list-container')) break;
+                    if (card && card.classList.contains('job-list-container')) break;
                 }
                 if (!card) return null;
                 const compEl = card.querySelector('.info-company__text');
@@ -60,22 +61,19 @@ async def producer(page, total_pages, keyword, queue):
             }).filter(item => item !== null);
         }"""
         jobs_data = await page.evaluate(js_code)
-        print(f"[Producer] 本頁偵測到 {len(jobs_data)} 個潛在項目...")
 
-        filter_tags = ["php", "PHP", "軟體", "資訊", "後端"]
         count = 0
         for data in jobs_data:
             title = (data["title"] or "").strip()
-            if not any(tag in title for tag in filter_tags):
+            # 使用動態傳入的 filter_tags 進行初步過濾
+            if not any(tag.lower() in title.lower() for tag in filter_tags):
                 continue
 
-            # 處理網址補全 (避開 f-string 冒號誤判)
             j_link = data["job_link"] or ""
             c_link = data["company_link"] or ""
             job_url = "https:" + j_link if j_link.startswith("//") else j_link
             comp_url = "https:" + c_link if c_link.startswith("//") else c_link
 
-            # 推入數據流
             payload = {
                 "title": title,
                 "company_name": data["company_name"],
@@ -97,8 +95,6 @@ async def consumer(queue):
     """
     消費者：負責將資料寫入 MariaDB
     """
-    import aiomysql
-
     try:
         conn = await aiomysql.connect(
             host=os.getenv("DB_HOST", "127.0.0.1"),
@@ -108,6 +104,7 @@ async def consumer(queue):
             db=os.getenv("DB_DATABASE"),
             charset="utf8mb4",
             autocommit=True,
+            init_command="SET time_zone = '+08:00'",
         )
     except Exception as e:
         print(f"[Consumer] ❌ 連線失敗: {e}")
@@ -143,18 +140,23 @@ async def consumer(queue):
     conn.close()
 
 
-async def run_list_scraper():
+async def run_list_scraper(keyword=None, filter_tags=None):
     """
-    啟動任務
+    啟動任務，接受 API 傳入的關鍵字與篩選標籤
     """
-    from playwright.async_api import async_playwright
-
-    kw = os.getenv("DEFAULT_KEYWORD", "php")
+    kw = keyword or os.getenv("DEFAULT_KEYWORD", "php")
+    tags = filter_tags or ["php", "PHP", "軟體", "資訊", "後端"]
     hl = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=hl)
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        )
         page = await context.new_page()
         try:
             print(f"[Stage A] 初始化搜尋: {kw}...")
@@ -162,9 +164,10 @@ async def run_list_scraper():
             await page.goto(base + "?keyword=" + kw + "&jobcat=2007000000")
             await page.wait_for_selector(".job-list-container")
 
-            await page.fill(".go-page__input input", "9999")
+            # 嘗試翻到最後一頁來獲取總頁數
+            await page.fill(".go-page__input input", "999")
             await page.keyboard.press("Enter")
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
             total = 1
             page_match = re.search(r"page=(\d+)", page.url)
@@ -175,7 +178,7 @@ async def run_list_scraper():
             q = asyncio.Queue()
             workers = [consumer(q) for _ in range(3)]
             await asyncio.gather(
-                producer(page, total, kw, q),
+                producer(page, total, kw, q, tags),
                 *workers,
             )
         except Exception as e:
