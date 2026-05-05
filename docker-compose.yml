@@ -3,17 +3,27 @@ version: '3.8'
 services:
   scraper-api:
     build:
-      context: ./scraper_api
+      context: .
       dockerfile: Dockerfile
+    image: job-digger-api:local
     container_name: job_digger_api
     ports:
-      # FastAPI 對外開放 8000
-      - "8000:8000"
+      # FastAPI 對外開放 host:85 → container:8000
+      # (admin 後台與本機開發者用,正式環境建議改 expose: 8000 不對外)
+      - "85:8000"
+    env_file:
+      - .env
     environment:
-      # 為了讓 Python 的 print 能即時顯示在 docker logs 中
+      # 即時顯示 Python print 到 docker logs
       - PYTHONUNBUFFERED=1
+      # DB 連線:從容器內走 service name(同 compose network)
+      - DB_HOST=job_db
+      - DB_PORT=3306
+      # CORS 白名單:允許 admin 後台
+      - ALLOWED_ORIGINS=http://localhost:84,http://127.0.0.1:84
+    depends_on:
+      - job_db
     restart: unless-stopped
-
   job_db:
     image: mariadb:latest
     container_name: job_digger_db

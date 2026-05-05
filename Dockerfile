@@ -1,28 +1,30 @@
-# 使用官方輕量 Python 映像檔
+# Job Digger FastAPI service (104 爬蟲 + 清洗)
 FROM python:3.11-slim
 
-# 安裝 Playwright 啟動無頭瀏覽器所需的系統依賴
+# Playwright 跑 chromium 需要的系統 deps + 一般工具
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 複製並安裝套件 (善用 Docker 快取)
+# 1. 先裝 Python 套件(這層 cache 友好,改 code 不必重裝)
 COPY requirements.txt .
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-# 安裝 Playwright Chromium 瀏覽器核心與系統函式庫
-RUN playwright install chromium
-RUN playwright install-deps chromium
-RUN playwright install
-# 複製專案程式碼
-COPY main.py .
+# 2. 裝 Playwright Chromium + 它的系統函式庫(~150MB)
+RUN playwright install chromium && playwright install-deps chromium
 
-# 開放 FastAPI 的 8000 Port
+# 3. 複製整個專案(app.py + 各 scraper 模組 + data_transform)
+COPY app.py ./
+COPY scpaper_company ./scpaper_company
+COPY scpaper_content ./scpaper_content
+COPY scraper_vacancies ./scraper_vacancies
+COPY data_transform ./data_transform
+
 EXPOSE 8000
 
-# 啟動微服務
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 啟動 FastAPI(注意:模組名是 app 不是 main)
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

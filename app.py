@@ -15,10 +15,17 @@ load_dotenv()
 
 app = FastAPI(title="Job Digger API Service")
 
-# 解決 CORS 問題，允許前端跨網域請求
+# CORS：僅允許 job_digger_admin 與本機開發 origin
+# (正式環境請覆寫 ALLOWED_ORIGINS env var,以逗號分隔)
+_default_origins = "http://localhost:84,http://127.0.0.1:84"
+_allowed_origins = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", _default_origins).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
