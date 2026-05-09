@@ -13,7 +13,7 @@ def test_environment_variable_loading():
 
 def test_data_cleaning_logic():
     """
-    這是一個模擬資料清洗 (Stage C) 的單元測試
+    這是一個模擬資料清洗 (Stage B) 的單元測試
     """
     raw_salary = "月薪40,000~60,000元"
     # 假設這是一個清洗函式

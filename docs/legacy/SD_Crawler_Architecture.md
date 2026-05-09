@@ -33,7 +33,7 @@
     - 採用 **UPSERT (ON DUPLICATE KEY UPDATE)** 語法。
     - 以 `job_link` 為唯一鍵，若職缺已存在則更新狀態位而不重複插入。
 
-### 3.4 公司探查器 (Explorer - Stage B)
+### 3.4 公司探查器 (Explorer - Stage C)
 - **職責**: 針對已採集之職缺，補全其所屬公司的詳細商業數據（資本額、員工人數）。
 - **數據補全策略**:
     - **採集去重**: 透過 SQL `GROUP BY company_link` 確保同一家公司僅點擊一次頁面。
@@ -50,7 +50,7 @@
     - Producer 載入第 N 頁 -> 捲動觸發渲染 -> JS 批次抓取 -> 放入 Queue。
     - Consumers 競爭 Queue 中的數據 -> 格式化網址 -> 寫入資料庫 (UPSERT)。
 
-### Phase 2: 公司探查 (Stage B)
+### Phase 2: 公司探查 (Stage C)
 1. **Fetch**: 從數據庫撈取待補全的公司清單。
 2. **Loop**:
     - 前往公司頁面 -> JS 擷取商業資訊 (資本、人數) -> 批次更新回資料庫。
@@ -62,6 +62,6 @@
 - `search_configs`: 存儲關鍵字搜尋配置與二次過濾標籤。
 
 ## 6. 後續擴展 (Roadmap)
-- **Stage B (Company Deep Dive)**: 針對已採集職缺，進入公司頁面爬取資本額等商業資訊。
+- **Stage C (Company Deep Dive)**: 針對已採集職缺，進入公司頁面爬取資本額等商業資訊。
 - **Redis Integration**: 導入 Redis 作為任務排程與即時狀態同步伺服器。
 - **API Wrapper**: 使用 FastAPI 提供外部介面觸發同步任務。

@@ -19,9 +19,9 @@
 ```
 Stage A — 清單採集
   ↓ 寫 vacancies(只填 title/company/job_link/salary)
-Stage C — 內文深度過濾
+Stage B — 內文深度過濾
   ↓ 對每筆打開內文,標 check_type='pass' / 'mismatch'
-Stage B — 公司資料補全
+Stage C — 公司資料補全
   ↓ 只對 check_type='pass' 的公司頁訪問,DISTINCT company_link 去重
 ```
 
@@ -40,7 +40,7 @@ for job in list:
 
 - ✅ 邏輯直覺,單迴圈
 - ❌ **同公司多次點擊**:100 個職缺可能屬於 20 家公司,你會重複點同公司 5 次。被 ban 機率高 + 浪費時間
-- ❌ **內文不通過的也浪費時間補公司資料**:Stage C 過濾掉 60% 的話,你白白多做 60% 的 Stage B
+- ❌ **內文不通過的也浪費時間補公司資料**:Stage B 過濾掉 60% 的話,你白白多做 60% 的 Stage C
 - ❌ **Stage 不能重跑**:某筆職缺的內文 fail,整個逐筆迴圈都得重來
 
 ### 選項 2 — A → B → C(先補公司,再過濾)
@@ -50,10 +50,10 @@ for job in list:
 
 ### 選項 3 — A → C → B (現選)
 
-- ✅ **去重**:Stage B 的 DISTINCT company_link 大幅省訪問次數
-- ✅ **省 Stage B 時間**:只對 C 通過的職缺補公司資料,通常省 50-80%
-- ✅ **每階段獨立可重跑**:Stage A 跑完寫 vacancies,即使 Stage C/B fail 資料還在 DB,下次重跑可以從中間階段開始
-- ✅ **每階段語意清楚**:A 是 Producer-Consumer 並發、C 是純過濾、B 是去重訪問,職責不混
+- ✅ **去重**:Stage C 的 DISTINCT company_link 大幅省訪問次數
+- ✅ **省 Stage C 時間**:只對 B 通過的職缺補公司資料,通常省 50-80%
+- ✅ **每階段獨立可重跑**:Stage A 跑完寫 vacancies,即使 Stage B/C fail 資料還在 DB,下次重跑可以從中間階段開始
+- ✅ **每階段語意清楚**:A 是 Producer-Consumer 並發、B 是純過濾、C 是去重訪問,職責不混
 - ⚠ **三次掃 DB**:每階段 SELECT 一次 vacancies,有 overhead(但比逐筆爬省太多)
 
 ### 選項 4 — 用 message queue (Kafka/RabbitMQ) 串起三階段
@@ -85,23 +85,23 @@ for job in list:
   - data-model.md 寫清楚每階段寫什麼欄位
   - 加 integration test 驗整個 pipeline
 
-- **Sub-stage 失敗判定不清**:Stage A 寫了 1000 筆但其中 50 筆 fail 沒有特別標記;Stage B 完成標記沒有(只看 capital != '0' 推測)。緩解:
+- **Sub-stage 失敗判定不清**:Stage A 寫了 1000 筆但其中 50 筆 fail 沒有特別標記;Stage C 完成標記沒有(只看 capital != '0' 推測)。緩解:
   - 加 `crawl_logs` 表記每階段執行 stats(Roadmap)
   - 加 `stage_status` 欄位 enum 'pending'/'a_done'/'c_done'/'b_done'
 
 ### 🔁 後續追蹤
 
-- 監控每階段執行時間 vs 職缺數,若 C 過濾率太低(<20%)代表 keyword/filter_tags 太寬
+- 監控每階段執行時間 vs 職缺數,若 C 過濾率太低(<20%)代表 keyword/title_tags/content_tags 太寬
 - 若加新階段(例如 Stage D 評分),確認順序
-- 若公司頁變慢,Stage B 可獨立 scale(拆成獨立 worker container)
+- 若公司頁變慢,Stage C 可獨立 scale(拆成獨立 worker container)
 
 ## References
 
 - Code:
   - `app.py::start_scraping_task` — 三階段順序的 orchestrator
   - `scraper_vacancies/main.py::run_list_scraper` — Stage A
-  - `scpaper_content/main.py::run_content_scraper` — Stage C
-  - `scpaper_company/main.py::run_company_scraper` — Stage B
+  - `scpaper_content/main.py::run_content_scraper` — Stage B
+  - `scpaper_company/main.py::run_company_scraper` — Stage C
 - 文件:
   - [`docs/sequence-diagrams.md` 第 1-3 節](../sequence-diagrams.md) — 三階段詳細時序
   - [`docs/architecture.md` Level 5](../architecture.md#level-5--三階段-pipeline-詳述) — 三階段職責劃分

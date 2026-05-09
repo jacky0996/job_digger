@@ -7,8 +7,8 @@
 涵蓋四個流程:
 
 1. Stage A — 清單採集(Producer-Consumer 並發)
-2. Stage C — 內文深度過濾
-3. Stage B — 公司資料補全(去重訪問)
+2. Stage B — 內文深度過濾
+3. Stage C — 公司資料補全(去重訪問)
 4. (Roadmap)Admin 觸發 → 整體 pipeline
 
 ---
@@ -19,7 +19,7 @@
 
 ```mermaid
 flowchart TD
-    Start([開始 Stage A]) --> ReceiveParams[接收參數: keyword, filter_tags]
+    Start([開始 Stage A]) --> ReceiveParams[接收參數: keyword, title_tags / content_tags]
     ReceiveParams --> LaunchBrowser[啟動 Playwright Chromium<br/>+ stealth plugin]
 
     subgraph init["Phase 1: 精準搜尋模擬"]
@@ -45,7 +45,7 @@ flowchart TD
         ScrapingLoop -- 執行中 --> ScrollDown[捲動到底觸發 lazy-load]
         ScrollDown --> JsExtract[page.evaluate JS 批次抽:<br/>title, company, job_link, salary]
         JsExtract --> AnchorTrace[錨點回溯:<br/>從 .info-job__text 找父 card]
-        AnchorTrace --> FilterTitle{標題含<br/>filter_tags 任一?}
+        AnchorTrace --> FilterTitle{標題含<br/>title_tags / content_tags 任一?}
         FilterTitle -- 是 --> EnqueueData[放進 asyncio.Queue]
         FilterTitle -- 否 --> NextPage
         EnqueueData --> NextPage[點下一頁]
@@ -76,11 +76,11 @@ flowchart TD
 
 ---
 
-## 2. Stage C — 內文深度過濾
+## 2. Stage B — 內文深度過濾
 
-「Stage A 用標題過濾過了,為什麼還要 Stage C?」
+「Stage A 用標題過濾過了,為什麼還要 Stage B?」
 
-因為標題常有「軟體工程師(Backend)」這種模糊命名,標題過了但內文要求其實是 .NET 不是 PHP。Stage C 打開內文做更精確的判斷。
+因為標題常有「軟體工程師(Backend)」這種模糊命名,標題過了但內文要求其實是 .NET 不是 PHP。Stage B 打開內文做更精確的判斷。
 
 ```mermaid
 sequenceDiagram
@@ -98,7 +98,7 @@ sequenceDiagram
         Pw->>Site: GET 內文頁
         Site-->>Pw: HTML
         Pw->>Pw: page.content() 取整頁 HTML
-        Orch->>Orch: 比對 filter_tags 是否在內文出現
+        Orch->>Orch: 比對 title_tags / content_tags 是否在內文出現
 
         alt 通過
             Orch->>DB: UPDATE vacancies SET check_type='pass' WHERE id=?
@@ -109,7 +109,7 @@ sequenceDiagram
         end
     end
 
-    Note over Orch: 完成,Stage B 只看 check_type='pass' 的
+    Note over Orch: 完成,Stage C 只看 check_type='pass' 的
 ```
 
 **重點**:**不刪除不通過的紀錄**,標 `check_type` 即可。理由:
@@ -118,7 +118,7 @@ sequenceDiagram
 
 ---
 
-## 3. Stage B — 公司資料補全(去重訪問)
+## 3. Stage C — 公司資料補全(去重訪問)
 
 「補資本額 / 員工數,要去重避免同公司多次點擊」
 
@@ -167,8 +167,8 @@ sequenceDiagram
     participant API as Job Digger API :85
     participant Bg as BackgroundTasks
     participant SA as Stage A scraper
-    participant SC as Stage C scraper
     participant SB as Stage B scraper
+    participant SC as Stage C scraper
     participant DB as MariaDB
 
     U->>Adm: 點「執行爬蟲」(config_id=1)
@@ -182,20 +182,20 @@ sequenceDiagram
 
     Note over Bg,DB: --- 以下背景非同步進行 ---
 
-    Bg->>DB: SELECT keyword, filter_tags FROM search_configs WHERE id=1
-    DB-->>Bg: keyword="php", filter_tags=["php","後端"]
+    Bg->>DB: SELECT keyword, title_tags, content_tags FROM search_configs WHERE id=1
+    DB-->>Bg: keyword="php", title_tags=["php","後端"], content_tags=["php","後端"]
 
     Bg->>SA: run_list_scraper("php", ["php","後端"])
     Note over SA: 詳見第 1 節 Stage A 流程
     SA->>DB: UPSERT vacancies (含初步過濾)
 
-    Bg->>SC: run_content_scraper("php", ["php","後端"])
-    Note over SC: 詳見第 2 節 Stage C 流程
-    SC->>DB: UPDATE check_type
+    Bg->>SB: run_content_scraper("php", ["php","後端"])
+    Note over SB: 詳見第 2 節 Stage B 流程
+    SB->>DB: UPDATE check_type
 
-    Bg->>SB: run_company_scraper()
-    Note over SB: 詳見第 3 節 Stage B 流程
-    SB->>DB: UPDATE capital + employee_count
+    Bg->>SC: run_company_scraper()
+    Note over SC: 詳見第 3 節 Stage C 流程
+    SC->>DB: UPDATE capital + employee_count
 
     Bg->>API: active_tasks.discard(1)
 
@@ -222,7 +222,7 @@ sequenceDiagram
 | Playwright Stealth | Stage A/B/C 共用 | navigator.webdriver / plugins / languages 等 fingerprint 偵測 |
 | 模擬人類點擊(input → click → wait) | Stage A 搜尋部分 | 偵測「直接 navigate 帶 query string」這種 bot 行為 |
 | 末頁探測 hack(避免 brute-force 翻頁)| Stage A | 短時間內大量翻頁的 rate-based 偵測 |
-| 公司頁去重(DISTINCT) | Stage B | 同 IP 短時間重複訪問同 URL |
+| 公司頁去重(DISTINCT) | Stage C | 同 IP 短時間重複訪問同 URL |
 | 第一道過濾在 Producer | Stage A | 不寫入「假興趣」職缺,間接降低 DB 壓力 |
 | 適度 sleep(目前未統一)| 各 stage scraper 內 | rate limit |
 

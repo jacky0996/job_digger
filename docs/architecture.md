@@ -66,12 +66,12 @@ flowchart TB
 
     subgraph orchestrator["Orchestrator (start_scraping_task)"]
         active["active_tasks set<br/>(防重複觸發)"]
-        sequence["Stage A → Stage C → Stage B"]
+        sequence["Stage A → Stage B → Stage C"]
     end
 
     subgraph stages["三階段 Scraper Modules"]
-        stage_a["scraper_vacancies.main<br/>run_list_scraper(keyword, filter_tags)"]
-        stage_c["scpaper_content.main<br/>run_content_scraper(keyword, filter_tags)"]
+        stage_a["scraper_vacancies.main<br/>run_list_scraper(keyword, title_tags)"]
+        stage_c["scpaper_content.main<br/>run_content_scraper(keyword, content_tags)"]
         stage_b["scpaper_company.main<br/>run_company_scraper()"]
     end
 
@@ -159,19 +159,19 @@ flowchart LR
 
 ### Stage A — 清單採集(Producer)
 
-`scraper_vacancies/main.py::run_list_scraper(keyword, filter_tags)`
+`scraper_vacancies/main.py::run_list_scraper(keyword, title_tags)`
 
 1. **末頁探測 hack** — 在跳轉欄位輸入 `9999`,讓 104 顯示真實末頁(避免 brute-force 翻頁)
 2. **逐頁抓** — 每頁向下捲動觸發 JS render,然後 `page.evaluate` 一口氣抽出所有職缺卡片
 3. **錨點回溯** — 從 `.info-job__text` 元素往上找最近的職缺卡片容器(避免 hardcode XPath)
-4. **第一道過濾** — 檢查標題是否含 filter_tags 任一個,不含就跳過(在 producer 端就過濾,減少寫入量)
-5. **寫進 vacancies**(只填 title / company / job_link / salary,公司詳細資訊空著等 Stage B)
+4. **第一道過濾** — 檢查標題是否含 title_tags 任一個,不含就跳過(在 producer 端就過濾,減少寫入量)
+5. **寫進 vacancies**(只填 title / company / job_link / salary,公司詳細資訊空著等 Stage C)
 
 詳細時序見 [`sequence-diagrams.md` 第 1 節](./sequence-diagrams.md#1-stage-a-清單採集-producer-consumer)。
 
-### Stage C — 內文深度過濾
+### Stage B — 內文深度過濾
 
-`scpaper_content/main.py::run_content_scraper(keyword, filter_tags)`
+`scpaper_content/main.py::run_content_scraper(keyword, content_tags)`
 
 1. 從 DB 撈出 Stage A 寫入但 `check_type IS NULL` 的 vacancies
 2. 對每筆打開 job_link 看內文
@@ -181,7 +181,7 @@ flowchart LR
 
 > **為何 C 在 B 之前**:先過濾掉不要的職缺,才不用浪費時間在不要的職缺上補公司資料。
 
-### Stage B — 公司資料補全(Explorer)
+### Stage C — 公司資料補全(Explorer)
 
 `scpaper_company/main.py::run_company_scraper()`
 

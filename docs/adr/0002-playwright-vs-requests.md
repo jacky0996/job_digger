@@ -104,8 +104,8 @@
 
 - Code:
   - `scraper_vacancies/main.py` — Stage A 用 Playwright
-  - `scpaper_company/main.py` — Stage B
-  - `scpaper_content/main.py` — Stage C
+  - `scpaper_company/main.py` — Stage C
+  - `scpaper_content/main.py` — Stage B
 - 文件:
   - [`docs/sequence-diagrams.md` 第 1 節](../sequence-diagrams.md#1-stage-a-清單採集-producer-consumer) — Stage A 詳細流程
   - [`docs/sequence-diagrams.md` 第 5 節](../sequence-diagrams.md#5-反爬策略總覽) — 反爬手段彙整

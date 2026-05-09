@@ -20,7 +20,10 @@ services:
       - DB_HOST=job_db
       - DB_PORT=3306
       # CORS 白名單:允許 admin 後台
-      - ALLOWED_ORIGINS=http://localhost:84,http://127.0.0.1:84
+      # (admin 用 8084 而非 84 — 84 被 macOS / Docker Desktop reserve)
+      - ALLOWED_ORIGINS=http://localhost:8084,http://127.0.0.1:8084
+      # 容器內無 X server,Playwright 必須 headless,否則 chromium 一 launch 就 crash
+      - BROWSER_HEADLESS=true
     depends_on:
       - job_db
     restart: unless-stopped

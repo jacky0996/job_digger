@@ -129,7 +129,7 @@ open http://localhost:85/docs
 ```bash
 # 看有哪些 search_configs(預設 init.sql 有插一筆 keyword='php')
 docker exec -it job_digger_db mariadb -udigger_user -p job_digger \
-  -e "SELECT id, keyword, filter_tags FROM search_configs"
+  -e "SELECT id, keyword, title_tags, content_tags FROM search_configs"
 
 # 觸發
 curl -X POST http://localhost:85/api/scrape/1

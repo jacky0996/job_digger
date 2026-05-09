@@ -1,19 +1,87 @@
 import asyncio
 import os
+import random
 import re
 
 import aiomysql
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
 load_dotenv()
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
 
-async def producer(page, total_pages, keyword, queue, filter_tags):
+PER_PAGE_MAX_ATTEMPTS = int(os.getenv("PER_PAGE_MAX_ATTEMPTS", 3))
+CF_CHALLENGE_KEYWORDS = ("正在執行安全驗證", "Just a moment", "Checking your browser")
+
+
+async def _has_cf_challenge(page) -> bool:
+    try:
+        return await page.evaluate(
+            "(kws) => { const t = document.body ? document.body.innerText : ''; "
+            "return kws.some(k => t.includes(k)); }",
+            list(CF_CHALLENGE_KEYWORDS),
+        )
+    except Exception:
+        return False
+
+
+async def _pass_cf_challenge(page, timeout_ms=30000) -> bool:
+    """偵測到 CF challenge 時等它自動解。等不過 fallback 重整一次,還是不過就放棄。"""
+    if not await _has_cf_challenge(page):
+        return True
+
+    try:
+        await page.wait_for_function(
+            "(kws) => { const t = document.body ? document.body.innerText : ''; "
+            "return !kws.some(k => t.includes(k)); }",
+            arg=list(CF_CHALLENGE_KEYWORDS),
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:
+        pass
+
+    try:
+        await page.reload(wait_until="load", timeout=30000)
+        await asyncio.sleep(random.uniform(2, 4))
+        return not await _has_cf_challenge(page)
+    except Exception:
+        return False
+
+
+async def _goto_with_retry(page, url, max_attempts=PER_PAGE_MAX_ATTEMPTS) -> bool:
+    """單頁 goto + CF 挑戰處理,最多重試 max_attempts 次。"""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await page.goto(url, wait_until="load", timeout=30000)
+            if await _pass_cf_challenge(page):
+                return True
+            print(f"[Producer] ⚠️ CF 挑戰未解 (attempt {attempt}/{max_attempts})")
+        except Exception as e:
+            print(f"[Producer] ⚠️ goto 失敗 (attempt {attempt}/{max_attempts}): {e}")
+        await asyncio.sleep(random.uniform(3, 6))
+    return False
+
+
+async def producer(page, total_pages, keyword, queue, title_tags, progress=None):
     """
-    生產者：負責翻頁、擷取清單資料並推入 Queue
+    生產者：負責翻頁、擷取清單資料並推入 Queue。
+    progress(optional dict): 由 app.py 傳入,寫入 current 反映目前頁數。
     """
     for p_num in range(1, total_pages + 1):
+        if progress is not None:
+            progress["current"] = p_num
         print(f"\n[Producer] 🚀 正在處理第 {p_num}/{total_pages} 頁...")
 
         # 構建分頁 URL
@@ -21,13 +89,15 @@ async def producer(page, total_pages, keyword, queue, filter_tags):
         q_str = f"?keyword={keyword}&jobcat=2007000000&page={p_num}"
         target_url = base_url + q_str
 
-        await page.goto(target_url, wait_until="load")
+        if not await _goto_with_retry(page, target_url):
+            print(f"[Producer] ❌ 第 {p_num} 頁多次重試仍失敗,跳過。")
+            continue
 
         # 1. 確保職務標籤已掛載
         try:
             await page.wait_for_selector(".info-job__text", timeout=10000)
-            await page.evaluate("window.scrollBy(0, 400)")  # 觸發滾動
-            await asyncio.sleep(1.5)
+            await page.evaluate(f"window.scrollBy(0, {random.randint(300, 600)})")
+            await asyncio.sleep(random.uniform(1.2, 2.5))
         except Exception:
             print(f"[Producer] ⚠️ 第 {p_num} 頁載入異常，繼續...")
 
@@ -65,8 +135,8 @@ async def producer(page, total_pages, keyword, queue, filter_tags):
         count = 0
         for data in jobs_data:
             title = (data["title"] or "").strip()
-            # 使用動態傳入的 filter_tags 進行初步過濾
-            if not any(tag.lower() in title.lower() for tag in filter_tags):
+            # 使用動態傳入的 title_tags 進行初步過濾
+            if not any(tag.lower() in title.lower() for tag in title_tags):
                 continue
 
             j_link = data["job_link"] or ""
@@ -86,7 +156,7 @@ async def producer(page, total_pages, keyword, queue, filter_tags):
             count += 1
 
         print(f"[Producer] ✅ 第 {p_num} 頁完成，符合 {count} 筆。")
-        await asyncio.sleep(1)
+        await asyncio.sleep(random.uniform(1.5, 3.0))
 
     await queue.put(None)
 
@@ -140,34 +210,47 @@ async def consumer(queue):
     conn.close()
 
 
-async def run_list_scraper(keyword=None, filter_tags=None):
+async def run_list_scraper(keyword=None, title_tags=None, progress=None):
     """
-    啟動任務，接受 API 傳入的關鍵字與篩選標籤
+    啟動任務，接受 API 傳入的關鍵字與篩選標籤。
+    progress(optional dict): app.py 傳入,本 stage 會寫入 total=末頁數、current=目前頁。
     """
     kw = keyword or os.getenv("DEFAULT_KEYWORD", "php")
-    tags = filter_tags or ["php", "PHP", "軟體", "資訊", "後端"]
+    tags = title_tags or ["php", "PHP", "軟體", "資訊", "後端"]
     hl = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=hl)
+    async with Stealth().use_async(async_playwright()) as p:
+        browser = await p.chromium.launch(
+            headless=hl,
+            channel="chrome",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
         context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            )
+            user_agent=random.choice(USER_AGENTS),
+            viewport={
+                "width": random.choice([1280, 1366, 1440, 1536, 1680, 1920]),
+                "height": random.choice([720, 800, 900, 1080]),
+            },
+            locale="zh-TW",
+            timezone_id="Asia/Taipei",
         )
         page = await context.new_page()
         try:
             print(f"[Stage A] 初始化搜尋: {kw}...")
             base = "https://www.104.com.tw/jobs/search/"
-            await page.goto(base + "?keyword=" + kw + "&jobcat=2007000000")
-            await page.wait_for_selector(".job-list-container")
+            initial_url = base + "?keyword=" + kw + "&jobcat=2007000000"
+            if not await _goto_with_retry(page, initial_url):
+                raise RuntimeError("初始頁面多次重試仍無法通過 CF 挑戰")
+            await page.wait_for_selector(".job-list-container", timeout=15000)
 
             # 嘗試翻到最後一頁來獲取總頁數
             await page.fill(".go-page__input input", "999")
             await page.keyboard.press("Enter")
-            await asyncio.sleep(2)
+            await asyncio.sleep(random.uniform(2, 3.5))
 
             total = 1
             page_match = re.search(r"page=(\d+)", page.url)
@@ -175,14 +258,18 @@ async def run_list_scraper(keyword=None, filter_tags=None):
                 total = int(page_match.group(1))
             print(f"[Stage A] 探測完成，共計 {total} 頁。")
 
+            if progress is not None:
+                progress["total"] = total
+
             q = asyncio.Queue()
             workers = [consumer(q) for _ in range(3)]
             await asyncio.gather(
-                producer(page, total, kw, q, tags),
+                producer(page, total, kw, q, tags, progress=progress),
                 *workers,
             )
         except Exception as e:
             print(f"[Stage A] 異常: {e}")
+            raise  # 由 app.py orchestrator 捕捉並寫入 progress.error
         finally:
             await browser.close()
             print("[Stage A] 系統關閉。")

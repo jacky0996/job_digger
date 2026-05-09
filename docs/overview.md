@@ -6,7 +6,7 @@
 
 ## 1. 系統定位 — 一句話
 
-> **Job Digger 是「104 職缺爬蟲服務」**:吃 keyword + filter_tags 進去,跑三階段 pipeline(清單 → 內文過濾 → 公司資料補全),把符合條件的職缺存進 MariaDB。提供 HTTP API 給 [Job Digger Admin](../../job_digger_admin) 觸發。
+> **Job Digger 是「104 職缺爬蟲服務」**:吃 keyword + title_tags + content_tags 進去,跑三階段 pipeline(清單 → 內文過濾 → 公司資料補全),把符合條件的職缺存進 MariaDB。提供 HTTP API 給 [Job Digger Admin](../../job_digger_admin) 觸發。
 
 它**不**做的事:不渲染 UI、不對 End User 開放、不處理身分驗證(Admin 才管那些)。本系統純粹是 **「爬蟲 service + DB owner」**。
 
@@ -59,14 +59,14 @@ flowchart LR
 
 業務流程:
 ```
-Admin 在 UI 設 keyword="PHP", filter_tags="php,後端"
+Admin 在 UI 設 keyword="PHP", title_tags="php,後端"
   ↓
 (觸發) POST /api/scrape/1
   ↓
 本系統背景跑:
   Stage A — 開 Chromium 進 104,搜 "PHP",抓所有清單頁
-  Stage C — 對清單職缺打開內文,過濾掉標題沒含 "php" / "後端" 的
-  Stage B — 對通過 C 的職缺,點公司頁補資本額 / 員工數
+  Stage B — 對清單職缺打開內文,過濾掉標題沒含 "php" / "後端" 的
+  Stage C — 對通過 B 的職缺,點公司頁補資本額 / 員工數
   寫進 vacancies 表(UPSERT by job_link)
   ↓
 Admin 在 /vacancies/search 看結果

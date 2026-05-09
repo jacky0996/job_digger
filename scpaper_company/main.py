@@ -38,9 +38,10 @@ async def scrape_company_info(page, company_url):
         return {"capital": "0", "employees": ""}
 
 
-async def run_company_scraper(keyword=None):
+async def run_company_scraper(keyword=None, progress=None):
     """
     主排程：從 DB 找出缺少資料的公司並進行採集。可接受動態關鍵字。
+    progress(optional dict): 寫入 total=待補公司數,current=已處理數。
     """
     kw = keyword or os.getenv("DEFAULT_KEYWORD", "php")
 
@@ -75,6 +76,8 @@ async def run_company_scraper(keyword=None):
             return
 
         print(f"[Stage B] 🚀 發現 {len(companies)} 家公司待查...")
+        if progress is not None:
+            progress["total"] = len(companies)
 
         hl = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
         async with async_playwright() as p:
@@ -88,7 +91,9 @@ async def run_company_scraper(keyword=None):
             )
             page = await context.new_page()
 
-            for comp in companies:
+            for idx, comp in enumerate(companies, start=1):
+                if progress is not None:
+                    progress["current"] = idx
                 c_name = comp["company_name"]
                 c_url = comp["company_link"]
 
