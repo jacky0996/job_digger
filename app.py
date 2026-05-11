@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 
@@ -13,6 +14,17 @@ from scpaper_content.main import run_content_scraper
 from scraper_vacancies.main import run_list_scraper
 
 load_dotenv()
+
+
+# 過濾掉 admin 前端高頻 polling 的 access log,
+# 不然 scraper 自己 print 的進度會被 GET /api/scrape/status/* 200 OK 洗掉。
+class _SuppressStatusPollingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/api/scrape/status/" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressStatusPollingFilter())
 
 app = FastAPI(title="Job Digger API Service")
 
@@ -44,7 +56,7 @@ app.add_middleware(
 # Progress schema:
 #   {
 #     "config_id": int,
-#     "stage": "init"|"A"|"C"|"B"|"done"|"failed",
+#     "stage": "init"|"A"|"B"|"C"|"done"|"failed",
 #     "current": int, "total": int,        # 當前 stage 的進度,跨 stage 會 reset
 #     "started_at": float,                 # epoch seconds
 #     "finished_at": float | None,         # None 代表仍在跑
@@ -74,7 +86,7 @@ def _build_status(config_id: int, p: dict | None) -> dict:
     elapsed = (p.get("finished_at") or time.time()) - p["started_at"]
     eta = None
     cur, tot = p["current"], p["total"]
-    if _is_running(p) and cur > 0 and tot > 0 and p["stage"] in ("A", "C", "B"):
+    if _is_running(p) and cur > 0 and tot > 0 and p["stage"] in ("A", "B", "C"):
         # 簡單線性外推 — 只反映「目前 stage 還剩多久」,不跨 stage 估計
         eta = max(0, int(elapsed * (tot - cur) / cur))
 
@@ -165,16 +177,16 @@ async def start_scraping_task(config_id: int):
             keyword=keyword, title_tags=title_tags, progress=progress
         )
 
-        progress["stage"] = "C"
+        progress["stage"] = "B"
         progress["current"], progress["total"] = 0, 0
-        print("\n>>> [Stage C] 啟動內文深度過濾...")
+        print("\n>>> [Stage B] 啟動內文深度過濾...")
         await run_content_scraper(
             keyword=keyword, content_tags=content_tags, progress=progress
         )
 
-        progress["stage"] = "B"
+        progress["stage"] = "C"
         progress["current"], progress["total"] = 0, 0
-        print("\n>>> [Stage B] 啟動公司資訊補全...")
+        print("\n>>> [Stage C] 啟動公司資訊補全...")
         await run_company_scraper(keyword=keyword, progress=progress)
 
         progress["stage"] = "done"

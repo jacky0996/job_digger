@@ -3,6 +3,7 @@ uvicorn
 playwright
 python-dotenv
 aiomysql
+httpx
 # Testing & Linting
 pytest
 pytest-asyncio

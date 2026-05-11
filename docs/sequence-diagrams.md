@@ -76,70 +76,106 @@ flowchart TD
 
 ---
 
-## 2. Stage B — 內文深度過濾
+## 2. Stage B — 內文深度過濾(104 API)
 
 「Stage A 用標題過濾過了,為什麼還要 Stage B?」
 
-因為標題常有「軟體工程師(Backend)」這種模糊命名,標題過了但內文要求其實是 .NET 不是 PHP。Stage B 打開內文做更精確的判斷。
+因為標題常有「軟體工程師(Backend)」這種模糊命名,標題過了但內文要求其實是 .NET 不是 PHP。Stage B 用 **104 公開 API** 取內文做更精確的判斷(見 [ADR-0005](./adr/0005-stage-bc-switch-to-104-api.md))。
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Orch as Orchestrator
+    participant Orch as run_content_scraper
     participant DB as MariaDB (vacancies)
-    participant Pw as Playwright
-    participant Site as 104 內文頁
+    participant InQ as in_queue
+    participant W as Worker × N=5
+    participant API as 104 API<br/>/api/jobs/{no}
+    participant OutQ as out_queue
+    participant Wr as Writer (single)
 
-    Orch->>DB: SELECT * FROM vacancies<br/>WHERE keyword=? AND check_type IS NULL
+    Orch->>DB: SELECT id, job_link, title<br/>WHERE keyword=? AND check_type IS NULL<br/>OR check_type='偵測逾時...'
     DB-->>Orch: List<Vacancy> (待檢查)
+    Orch->>InQ: 全部 enqueue + N 個 sentinel
+    Orch->>W: spawn N workers
+    Orch->>Wr: spawn writer
 
-    loop 每筆 vacancy
-        Orch->>Pw: page.goto(vacancy.job_link)
-        Pw->>Site: GET 內文頁
-        Site-->>Pw: HTML
-        Pw->>Pw: page.content() 取整頁 HTML
-        Orch->>Orch: 比對 title_tags / content_tags 是否在內文出現
-
-        alt 通過
-            Orch->>DB: UPDATE vacancies SET check_type='pass' WHERE id=?
-        else 不通過(關鍵字 mismatch)
-            Orch->>DB: UPDATE check_type='keyword_mismatch'
-        else 年資/學歷不符(進階)
-            Orch->>DB: UPDATE check_type='seniority_mismatch'
+    par 平行 N=5
+        loop 每筆
+            W->>InQ: get()
+            W->>W: 從 job_link regex 抽 job_no
+            W->>API: GET /api/jobs/{job_no}
+            API-->>W: JSON {data: {jobDetail, condition}}
+            W->>W: _classify(data, content_tags)<br/>HTML strip + 去空白 + substring 比對<br/>優先序: 工作內容→加分條件→擅長工具
+            W->>OutQ: put({id, kind, check_type})
+            W->>W: await sleep(0.3s)
         end
     end
 
-    Note over Orch: 完成,Stage C 只看 check_type='pass' 的
+    loop until N sentinel received
+        Wr->>OutQ: get()
+        alt kind=closed (HTTP 404)
+            Wr->>DB: UPDATE status='closed', deleted_at=NOW()
+        else kind=check
+            Wr->>DB: UPDATE check_type=?
+        end
+        Wr->>Wr: progress['current'] += 1
+    end
+
+    Note over Wr: 完成,Stage C 接續處理
 ```
 
-**重點**:**不刪除不通過的紀錄**,標 `check_type` 即可。理由:
-- 保留 audit trail(萬一過濾規則漏判,仍可從 DB 撈回來重審)
-- 重跑爬蟲時不會再對標過的職缺浪費 CPU(`WHERE check_type IS NULL` 直接跳過)
+**API 欄位對應**:
+
+| 寫進 DB 的 check_type | 對應 API 路徑 |
+|---|---|
+| `工作內容有含關鍵字` | `data.jobDetail.jobDescription` |
+| `加分條件或必要條件內有含關鍵字` | `data.condition.other` |
+| `僅有擅長工具含關鍵字,建議確認後再進行履歷投遞` | `data.condition.specialty[].description`(陣列串接)|
+| `no_match` | 三者都沒中 |
+
+**重點**:
+- **不刪除不通過的紀錄**:標 `check_type` 即可(包含 `no_match`),保留 audit trail
+- **HTML 處理**:`data.jobDetail.jobDescription` 是 HTML 字串(含 `<br>` `<p>` 等),比對前先 `_strip_html` + `html.unescape`
+- **比對邏輯與舊版完全相容**:`check_type` 字串沒變,admin UI 與 SQL 都不需要動
 
 ---
 
-## 3. Stage C — 公司資料補全(去重訪問)
+## 3. Stage C — 公司資料補全(104 API + 去重訪問)
 
-「補資本額 / 員工數,要去重避免同公司多次點擊」
+「補資本額 / 員工數,用 104 公開 API 取代瀏覽器訪問」
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Orch as Orchestrator
+    participant Orch as run_company_scraper
     participant DB as MariaDB
-    participant Pw as Playwright
-    participant Site as 104 公司頁
+    participant InQ as in_queue
+    participant W as Worker × N=5
+    participant API as 104 API<br/>/api/companies/{no}/content
+    participant OutQ as out_queue
+    participant Wr as Writer (single)
 
-    Orch->>DB: SELECT DISTINCT company_link FROM vacancies<br/>WHERE check_type='pass'<br/>AND (capital='0' OR employee_count='')
+    Orch->>DB: SELECT company_link FROM vacancies<br/>WHERE keyword=? AND (capital='0' OR empNo='')<br/>GROUP BY company_link
     DB-->>Orch: List<company_link> (去重後,通常比 vacancies 少 5-10 倍)
+    Orch->>InQ: 全部 enqueue + N 個 sentinel
+    Orch->>W: spawn N workers
+    Orch->>Wr: spawn writer
 
-    loop 每個 company_link
-        Orch->>Pw: page.goto(company_link)
-        Pw->>Site: GET 公司頁
-        Site-->>Pw: HTML
-        Pw->>Pw: page.evaluate:<br/>遍歷 .intro-table__head,<br/>找 "資本額" / "員工人數" label,<br/>取父節點下的 .t3.mb-0
+    par 平行 N=5
+        loop 每筆
+            W->>InQ: get()
+            W->>W: 從 company_link regex 抽 company_no
+            W->>API: GET /api/companies/{no}/content
+            API-->>W: JSON {data: {capital, empNo, ...}}
+            W->>OutQ: put({company_link, capital, employees})
+            W->>W: await sleep(0.3s)
+        end
+    end
 
-        Orch->>DB: UPDATE vacancies SET capital=?, employee_count=?<br/>WHERE company_link=?
+    loop until N sentinel received
+        Wr->>OutQ: get()
+        Wr->>DB: UPDATE vacancies SET capital=?, employee_count=?<br/>WHERE company_link=?
+        Wr->>Wr: progress['current'] += 1
         Note over DB: 同公司的所有職缺一起更新
     end
 ```
@@ -148,14 +184,15 @@ sequenceDiagram
 
 | 點 | 為什麼 |
 |---|---|
-| **去重 (DISTINCT company_link)** | 100 個職缺可能屬於 20 家公司,不去重會白白 5 倍時間 |
-| **只補空的** (`capital='0' OR employee_count=''`) | 第二次跑爬蟲時,已補的不再重補,加速 |
+| **去重 (GROUP BY company_link)** | 100 個職缺可能屬於 20 家公司,不去重會白白多打 5 倍 API |
+| **只補空的** (`capital='0' OR employee_count=''`) | 第二次跑爬蟲時,已補的不再重補 |
 | **批次 UPDATE WHERE company_link=?** | 同公司多個職缺一起更新,不是 N+1 |
-| **父節點下抓** | 104 的 DOM 結構是 `<th>標籤名</th><td class="t3 mb-0">值</td>`,先定位 label 再相對找值 |
+| **API 回傳的字串格式跟原本頁面抽取完全一致** | `"6000萬元"` / `"16人"`,DB 不會混兩種格式 |
+| **HTTP 404 → 寫 default** | 公司下架時寫 `capital='0'`,避免下次又被 SELECT 撈到無限重試(現有小毛病,可接受)|
 
 ---
 
-## 4. (Roadmap)Admin 觸發 → 整體 pipeline
+## 4. Admin 觸發 → 整體 pipeline
 
 「使用者按下 Admin 的『執行爬蟲』按鈕,完整跨系統時序」
 
@@ -186,18 +223,18 @@ sequenceDiagram
     DB-->>Bg: keyword="php", title_tags=["php","後端"], content_tags=["php","後端"]
 
     Bg->>SA: run_list_scraper("php", ["php","後端"])
-    Note over SA: 詳見第 1 節 Stage A 流程
+    Note over SA: 詳見第 1 節 Stage A 流程<br/>(Playwright)
     SA->>DB: UPSERT vacancies (含初步過濾)
 
-    Bg->>SB: run_content_scraper("php", ["php","後端"])
-    Note over SB: 詳見第 2 節 Stage B 流程
+    Bg->>SB: run_content_scraper("php", ["php","laravel"])
+    Note over SB: 詳見第 2 節 Stage B 流程<br/>(httpx → 104 API)
     SB->>DB: UPDATE check_type
 
-    Bg->>SC: run_company_scraper()
-    Note over SC: 詳見第 3 節 Stage C 流程
+    Bg->>SC: run_company_scraper("php")
+    Note over SC: 詳見第 3 節 Stage C 流程<br/>(httpx → 104 API)
     SC->>DB: UPDATE capital + employee_count
 
-    Bg->>API: active_tasks.discard(1)
+    Bg->>API: progress['finished_at'] = now()
 
     Note over U: --- 使用者另外開分頁 ---
     U->>Adm: 進「職缺搜尋」頁
@@ -219,12 +256,14 @@ sequenceDiagram
 
 | 手段 | 在哪實作 | 對抗什麼 |
 |---|---|---|
-| Playwright Stealth | Stage A/B/C 共用 | navigator.webdriver / plugins / languages 等 fingerprint 偵測 |
-| 模擬人類點擊(input → click → wait) | Stage A 搜尋部分 | 偵測「直接 navigate 帶 query string」這種 bot 行為 |
+| Playwright Stealth | Stage A | navigator.webdriver / plugins / languages 等 fingerprint 偵測 |
+| 模擬人類點擊(input → click → wait)| Stage A 搜尋部分 | 偵測「直接 navigate 帶 query string」這種 bot 行為 |
 | 末頁探測 hack(避免 brute-force 翻頁)| Stage A | 短時間內大量翻頁的 rate-based 偵測 |
-| 公司頁去重(DISTINCT) | Stage C | 同 IP 短時間重複訪問同 URL |
+| Resource blocker(擋 image/font/media + 追蹤 domain)| Stage A | 加速 + 降流量,間接降低被偵測機率 |
+| 公司頁去重(GROUP BY company_link)| Stage C | 同 IP 短時間重複請求同 endpoint |
 | 第一道過濾在 Producer | Stage A | 不寫入「假興趣」職缺,間接降低 DB 壓力 |
-| 適度 sleep(目前未統一)| 各 stage scraper 內 | rate limit |
+| Worker 間 sleep 0.3s | Stage B/C | API 端 rate limit,雖然門檻寬但仍避免流量集中 |
+| 退避重試(403/429 等 30 秒)| Stage B/C | 暫時被擋時不直接放棄 |
 
 **沒做但建議的**(對應 [adr/0002-playwright-vs-requests.md](./adr/0002-playwright-vs-requests.md) 的 Roadmap):
 - IP rotation(proxy pool)

@@ -24,6 +24,37 @@ USER_AGENTS = [
 PER_PAGE_MAX_ATTEMPTS = int(os.getenv("PER_PAGE_MAX_ATTEMPTS", 3))
 CF_CHALLENGE_KEYWORDS = ("正在執行安全驗證", "Just a moment", "Checking your browser")
 
+# 加速:不載入 image/font/media 與已知追蹤 domain。
+# 保留 document/script/stylesheet/xhr/fetch — SPA 渲染與抓資料都需要。
+# 若懷疑被偵測為 bot,設 BLOCK_RESOURCES=false 即可恢復原行為。
+_BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
+_BLOCKED_DOMAINS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "facebook.net",
+    "connect.facebook.net",
+    "hotjar.com",
+    "clarity.ms",
+)
+
+
+async def _register_resource_blocker(context):
+    if os.getenv("BLOCK_RESOURCES", "true").lower() != "true":
+        return
+
+    async def _handler(route):
+        req = route.request
+        if req.resource_type in _BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+            return
+        if any(d in req.url for d in _BLOCKED_DOMAINS):
+            await route.abort()
+            return
+        await route.continue_()
+
+    await context.route("**/*", _handler)
+
 
 async def _has_cf_challenge(page) -> bool:
     try:
@@ -218,17 +249,22 @@ async def run_list_scraper(keyword=None, title_tags=None, progress=None):
     kw = keyword or os.getenv("DEFAULT_KEYWORD", "php")
     tags = title_tags or ["php", "PHP", "軟體", "資訊", "後端"]
     hl = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
+    # USE_REAL_CHROME=true 要求宿主裝有 Google Chrome (channel="chrome")
+    # Docker 環境通常只有 bundled Chromium → 設 false
+    use_real_chrome = os.getenv("USE_REAL_CHROME", "true").lower() == "true"
 
     async with Stealth().use_async(async_playwright()) as p:
-        browser = await p.chromium.launch(
-            headless=hl,
-            channel="chrome",
-            args=[
+        launch_kwargs = {
+            "headless": hl,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
             ],
-        )
+        }
+        if use_real_chrome:
+            launch_kwargs["channel"] = "chrome"
+        browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport={
@@ -238,6 +274,7 @@ async def run_list_scraper(keyword=None, title_tags=None, progress=None):
             locale="zh-TW",
             timezone_id="Asia/Taipei",
         )
+        await _register_resource_blocker(context)
         page = await context.new_page()
         try:
             print(f"[Stage A] 初始化搜尋: {kw}...")

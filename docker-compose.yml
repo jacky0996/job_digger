@@ -24,6 +24,8 @@ services:
       - ALLOWED_ORIGINS=http://localhost:8084,http://127.0.0.1:8084
       # 容器內無 X server,Playwright 必須 headless,否則 chromium 一 launch 就 crash
       - BROWSER_HEADLESS=true
+      # 容器只裝 bundled Chromium (沒裝 Google Chrome),不能用 channel="chrome"
+      - USE_REAL_CHROME=false
     depends_on:
       - job_db
     restart: unless-stopped

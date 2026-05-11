@@ -1,149 +1,268 @@
+"""Stage B — 透過 104 公開 API 比對職缺內文,寫入 check_type 標籤。
+
+API 路徑:GET https://www.104.com.tw/api/jobs/{job_no}
+
+判定優先序(first match wins,沿用 Playwright 版邏輯,確保 check_type 字串完全相容):
+  1. data.jobDetail.jobDescription                 → 「工作內容有含關鍵字」
+  2. data.condition.other                          → 「加分條件或必要條件內有含關鍵字」
+  3. data.condition.specialty[].description (串接)  → 「僅有擅長工具含關鍵字,建議確認後再進行履歷投遞」
+  4. 都沒中                                         → 「no_match」
+
+比對規則:把文字 strip HTML + 解 entity + lowercase + 去空白後做 substring,
+跟原本 Playwright JS 的 containsTag 邏輯一致(只是處理移到 Python 端)。
+
+架構:Producer / Worker / Writer
+  - 同 Stage C,只是工作內容不同。
+"""
+
 import asyncio
+import html
 import os
-import random
+import re
+import time
 from datetime import datetime
 
 import aiomysql
+import httpx
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
 
 load_dotenv()
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-]
+# 平行度與時間參數(env 可調)
+STAGE_B_WORKERS = int(os.getenv("STAGE_B_WORKERS", 5))
+STAGE_B_REQUEST_DELAY = float(os.getenv("STAGE_B_REQUEST_DELAY", 0.3))
+STAGE_B_TIMEOUT = float(os.getenv("STAGE_B_TIMEOUT", 10))
 
-CONTEXT_ROTATE_EVERY = int(os.getenv("CONTEXT_ROTATE_EVERY", 50))
-LONG_BREAK_EVERY = int(os.getenv("LONG_BREAK_EVERY", 40))
-PER_JOB_MAX_ATTEMPTS = int(os.getenv("PER_JOB_MAX_ATTEMPTS", 3))
-CONTENT_POLL_ROUNDS = int(os.getenv("CONTENT_POLL_ROUNDS", 6))
-CF_CHALLENGE_KEYWORDS = ("正在執行安全驗證", "Just a moment", "Checking your browser")
-RETRYABLE_RESULTS = ("CF_CHALLENGE", "偵測逾時，建議手動確認")
+# 從 /job/{no}?... 抽流水碼
+_JOB_NO_RE = re.compile(r"/job/([^/?#]+)")
 
+# HTML 處理 — block-level 標籤替換為換行,避免 substring 比對時把多個欄位連在一起
+_BLOCK_TAGS_RE = re.compile(
+    r"</?(?:br|p|div|li|ul|ol|h[1-6]|tr|td|th)\b[^>]*>", re.IGNORECASE
+)
+_ANY_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
 
-async def _new_context(browser):
-    return await browser.new_context(
-        user_agent=random.choice(USER_AGENTS),
-        viewport={
-            "width": random.choice([1280, 1366, 1440, 1536, 1680, 1920]),
-            "height": random.choice([720, 800, 900, 1080]),
-        },
-        locale="zh-TW",
-        timezone_id="Asia/Taipei",
-    )
+_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+}
+
+# Sentinel:Worker 通知 Writer 結束
+_WORKER_DONE = object()
 
 
-async def _has_cf_challenge(page) -> bool:
-    try:
-        return await page.evaluate(
-            "(kws) => { const t = document.body ? document.body.innerText : ''; "
-            "return kws.some(k => t.includes(k)); }",
-            list(CF_CHALLENGE_KEYWORDS),
-        )
-    except Exception:
+def _extract_job_no(url: str) -> str | None:
+    if not url:
+        return None
+    m = _JOB_NO_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _strip_html(s: str) -> str:
+    """把 HTML 字串轉成可比對的純文字。block-level 標籤先換成空格防止文字粘連。"""
+    if not s:
+        return ""
+    s = _BLOCK_TAGS_RE.sub(" ", s)
+    s = _ANY_TAG_RE.sub("", s)
+    return html.unescape(s)
+
+
+def _normalize(s: str) -> str:
+    """全部 lowercase + 去空白,讓 substring 比對忽略大小寫與排版。"""
+    return _WHITESPACE_RE.sub("", s.lower())
+
+
+def _contains_any(text: str, tags: list[str]) -> bool:
+    if not text or not tags:
         return False
+    norm = _normalize(text)
+    return any(_normalize(tag) in norm for tag in tags if tag)
 
 
-async def _pass_cf_challenge(page, timeout_ms=30000) -> bool:
-    """偵測到 CF challenge 時等它自動解。等不過 fallback 重整一次,還是不過就放棄。"""
-    if not await _has_cf_challenge(page):
-        return True
+def _classify(api_data: dict, content_tags: list[str]) -> str:
+    """依優先序檢查 API 三個欄位,回傳對應的 check_type 字串。"""
+    # 1. 工作內容
+    job_desc = (api_data.get("jobDetail") or {}).get("jobDescription") or ""
+    if _contains_any(_strip_html(job_desc), content_tags):
+        return "工作內容有含關鍵字"
 
-    try:
-        await page.wait_for_function(
-            "(kws) => { const t = document.body ? document.body.innerText : ''; "
-            "return !kws.some(k => t.includes(k)); }",
-            arg=list(CF_CHALLENGE_KEYWORDS),
-            timeout=timeout_ms,
+    condition = api_data.get("condition") or {}
+
+    # 2. 其他條件(加分條件 / 必要條件)
+    other = condition.get("other") or ""
+    if _contains_any(_strip_html(other), content_tags):
+        return "加分條件或必要條件內有含關鍵字"
+
+    # 3. 擅長工具:把 specialty 陣列的 description 串成字串
+    specialty = condition.get("specialty") or []
+    if isinstance(specialty, list):
+        specialty_text = " ".join(
+            (item.get("description") or "")
+            for item in specialty
+            if isinstance(item, dict)
         )
-        return True
-    except Exception:
-        pass
+        if _contains_any(specialty_text, content_tags):
+            return "僅有擅長工具含關鍵字,建議確認後再進行履歷投遞"
+
+    return "no_match"
+
+
+async def _fetch_job(client: httpx.AsyncClient, job_no: str) -> tuple[int, dict | None]:
+    """打 API 拿 (status_code, data dict)。錯誤回傳 (status_code or 0, None)。"""
+    url = f"https://www.104.com.tw/api/jobs/{job_no}"
+    referer = f"https://www.104.com.tw/job/{job_no}"
+    try:
+        resp = await client.get(url, headers={**_API_HEADERS, "Referer": referer})
+    except (httpx.HTTPError, asyncio.TimeoutError):
+        return (0, None)
+
+    if resp.status_code in (403, 429):
+        await asyncio.sleep(30)
+        try:
+            resp = await client.get(url, headers={**_API_HEADERS, "Referer": referer})
+        except (httpx.HTTPError, asyncio.TimeoutError):
+            return (0, None)
+
+    if resp.status_code != 200:
+        return (resp.status_code, None)
 
     try:
-        await page.reload(wait_until="load", timeout=30000)
-        await asyncio.sleep(random.uniform(2, 4))
-        return not await _has_cf_challenge(page)
-    except Exception:
-        return False
+        payload = resp.json()
+    except ValueError:
+        return (200, None)
+
+    return (200, payload.get("data") or {})
 
 
-async def deep_analyze_job(page, url, tags):
-    try:
-        await page.goto(url, wait_until="load", timeout=30000)
+async def _worker(
+    in_queue: asyncio.Queue,
+    out_queue: asyncio.Queue,
+    client: httpx.AsyncClient,
+    content_tags: list[str],
+):
+    while True:
+        job = await in_queue.get()
+        if job is _WORKER_DONE:
+            in_queue.task_done()
+            await out_queue.put(_WORKER_DONE)
+            return
 
-        if not await _pass_cf_challenge(page):
-            return "CF_CHALLENGE"
+        job_no = _extract_job_no(job["job_link"])
+        if not job_no:
+            print(f"  [Stage B] ⏭ 略過(抽不到 job_no): id={job['id']}")
+            in_queue.task_done()
+            continue
 
-        is_loaded = False
-        for i in range(1, CONTENT_POLL_ROUNDS + 1):
-            if await page.query_selector(".job-description__content"):
-                is_loaded = True
-                break
-            await page.evaluate(f"window.scrollBy(0, {random.randint(300, 700)})")
-            await asyncio.sleep(random.uniform(2.5, 5.0))
+        status, data = await _fetch_job(client, job_no)
 
-        if not is_loaded:
-            return "偵測逾時，建議手動確認"
+        if status == 404:
+            await out_queue.put(
+                {"id": job["id"], "title": job["title"], "kind": "closed"}
+            )
+        elif data is not None:
+            check_type = _classify(data, content_tags)
+            await out_queue.put(
+                {
+                    "id": job["id"],
+                    "title": job["title"],
+                    "kind": "check",
+                    "check_type": check_type,
+                }
+            )
+        else:
+            # 連線失敗 / 非 200 / JSON 壞:不寫 DB,下次再試
+            print(f"  [Stage B] ⚠️ 跳過 (id={job['id']}, status={status})")
+
+        await asyncio.sleep(STAGE_B_REQUEST_DELAY)
+        in_queue.task_done()
+
+
+_STATS_LABEL_SHORT = {
+    "工作內容有含關鍵字": "工作內容",
+    "加分條件或必要條件內有含關鍵字": "加分條件",
+    "僅有擅長工具含關鍵字,建議確認後再進行履歷投遞": "擅長工具",
+    "no_match": "no_match",
+}
+
+
+async def _writer(
+    out_queue: asyncio.Queue,
+    cur,
+    progress: dict | None,
+    expected_done: int,
+    total: int,
+):
+    done_workers = 0
+    processed = 0
+    counts: dict[str, int] = {v: 0 for v in _STATS_LABEL_SHORT.values()}
+    counts["closed"] = 0
+
+    # 每 N 筆印一次進度小結;太小很吵、太大看不到進展
+    summary_every = max(10, total // 10)
+
+    while True:
+        item = await out_queue.get()
+        if item is _WORKER_DONE:
+            done_workers += 1
+            out_queue.task_done()
+            if done_workers >= expected_done:
+                return
+            continue
 
         try:
-            await page.mouse.move(random.randint(100, 800), random.randint(100, 600))
-        except Exception:
-            pass
+            if item["kind"] == "closed":
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                await cur.execute(
+                    "UPDATE vacancies SET status = 'closed', deleted_at = %s "
+                    "WHERE id = %s",
+                    (now, item["id"]),
+                )
+                processed += 1
+                counts["closed"] += 1
+                print(
+                    f"[Stage B {processed:>3}/{total}] 🚪 已下架  "
+                    f"id={item['id']} ({item['title']})"
+                )
+            else:
+                await cur.execute(
+                    "UPDATE vacancies SET check_type = %s WHERE id = %s",
+                    (item["check_type"], item["id"]),
+                )
+                processed += 1
+                short = _STATS_LABEL_SHORT.get(item["check_type"], item["check_type"])
+                counts[short] = counts.get(short, 0) + 1
+                marker = "✓" if short != "no_match" else "·"
+                print(
+                    f"[Stage B {processed:>3}/{total}] {marker} {short:<8} "
+                    f"id={item['id']} ({item['title']})"
+                )
 
-        js_logic = """(tags) => {
-            const containsTag = (text, tags) => {
-                if (!text) return false;
-                const lowerText = text.toLowerCase().replace(/\\s+/g, '');
-                return tags.some(tag => lowerText.includes(
-                    tag.toLowerCase().replace(/\\s+/g, '')
-                ));
-            };
+            if progress is not None:
+                progress["current"] = processed
 
-            const descEl = document.querySelector('.job-description__content');
-            if (descEl && containsTag(descEl.innerText, tags)) {
-                return "工作內容有含關鍵字";
-            }
-
-            const reqContainer = document.querySelector('.job-requirement') ||
-                                document.querySelector('.job-requirement-table');
-            if (reqContainer && containsTag(reqContainer.innerText, tags)) {
-                return "加分條件或必要條件內有含關鍵字";
-            }
-
-            // 第 3 檢查:擅長工具
-            // 以 .list-row__head 為 anchor — 找到 head 文字含「擅長工具」的 row,
-            // 取整個 row 的純文字(innerText 不含 HTML 標籤)再檢查關鍵字。
-            const heads = document.querySelectorAll('.list-row__head');
-            for (const head of heads) {
-                const headText = (head.innerText || '').replace(/\\s+/g, '');
-                if (!headText.includes('擅長工具')) continue;
-                const row = head.closest('.list-row') || head.parentElement;
-                if (row && containsTag(row.innerText, tags)) {
-                    return "僅有擅長工具含關鍵字,建議確認後再進行履歷投遞";
-                }
-            }
-            return null;
-        }"""
-        return await page.evaluate(js_logic, tags) or "no_match"
-    except Exception:
-        return "404_ERROR"
+            if processed % summary_every == 0 and processed < total:
+                pct = processed * 100 // total
+                print(
+                    f"  ── 進度 {processed}/{total} ({pct}%) | "
+                    f"工作內容={counts['工作內容']} 加分條件={counts['加分條件']} "
+                    f"擅長工具={counts['擅長工具']} no_match={counts['no_match']} "
+                    f"已下架={counts['closed']}"
+                )
+        except Exception as e:
+            print(f"  [Stage B] ❌ DB 寫入失敗 (id={item['id']}): {e}")
+        finally:
+            out_queue.task_done()
 
 
 async def run_content_scraper(keyword, content_tags, progress=None):
-    """
-    依照 API 傳入的 keyword 與 content_tags 進行內容清洗。
-    content_tags 是「內文關鍵字」清單(從 search_configs.content_tags 來),
-    跟 Stage A 的 title_tags 是不同欄位 — A 用標題收斂,B 用內文精準匹配。
-    progress(optional dict): 寫入 total=待檢查職缺數,current=已處理數。
+    """主排程:撈出待檢查職缺,打 104 API 比對 content_tags,寫入 check_type。
+
+    progress(optional dict): 寫入 total=待檢查職缺數, current=已處理數。
     """
     kw = keyword
 
@@ -158,108 +277,83 @@ async def run_content_scraper(keyword, content_tags, progress=None):
             autocommit=True,
             init_command="SET time_zone = '+08:00'",
         )
-    except Exception:
+    except Exception as e:
+        print(f"[Stage B] ❌ 資料庫連線失敗: {e}")
         return
 
-    async with conn.cursor(aiomysql.DictCursor) as cur:
-        # 增量爬取:只挑「沒處理過」或「上次偵測逾時」的
-        sql = (
-            "SELECT id, job_link, title FROM vacancies "
-            "WHERE status = 'active' AND keyword = %s "
-            "AND (check_type IS NULL OR check_type = '偵測逾時，建議手動確認')"
-        )
-        await cur.execute(sql, (kw,))
-        jobs = await cur.fetchall()
+    try:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # 增量爬取:沒處理過,或上次偵測逾時的(沿用舊邏輯)
+            sql = (
+                "SELECT id, job_link, title FROM vacancies "
+                "WHERE status = 'active' AND keyword = %s "
+                "AND (check_type IS NULL OR check_type = '偵測逾時，建議手動確認')"
+            )
+            await cur.execute(sql, (kw,))
+            jobs = await cur.fetchall()
 
-        if not jobs:
-            print(f"[Stage C] 🎉 '{kw}' 內文資料都已處理完畢")
-            conn.close()
-            return
+            if not jobs:
+                print(f"[Stage B] 🎉 '{kw}' 內文資料都已處理完畢")
+                return
 
-        if progress is not None:
-            progress["total"] = len(jobs)
+            total = len(jobs)
+            started = time.time()
+            print("=" * 60)
+            print("[Stage B] 🚀 內文比對啟動")
+            print(f"          keyword: {kw}")
+            print(f"          tags:    {content_tags}")
+            print(f"          待檢查:  {total} 筆")
+            print(f"          workers: {STAGE_B_WORKERS}")
+            print("=" * 60)
+            if progress is not None:
+                progress["total"] = total
 
-        hl = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
-        use_real_chrome = os.getenv("USE_REAL_CHROME", "true").lower() == "true"
-        async with Stealth().use_async(async_playwright()) as p:
-            launch_kwargs = {
-                "headless": hl,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                ],
-            }
-            if use_real_chrome:
-                launch_kwargs["channel"] = "chrome"
-            browser = await p.chromium.launch(**launch_kwargs)
-            context = await _new_context(browser)
-            page = await context.new_page()
-            timeout_streak = 0
+            in_queue: asyncio.Queue = asyncio.Queue()
+            out_queue: asyncio.Queue = asyncio.Queue()
 
-            for idx, job in enumerate(jobs, start=1):
-                if progress is not None:
-                    progress["current"] = idx
+            for j in jobs:
+                await in_queue.put(j)
+            for _ in range(STAGE_B_WORKERS):
+                await in_queue.put(_WORKER_DONE)
 
-                if idx > 1 and idx % CONTEXT_ROTATE_EVERY == 1:
-                    await context.close()
-                    context = await _new_context(browser)
-                    page = await context.new_page()
-
-                check_res = None
-                for attempt in range(1, PER_JOB_MAX_ATTEMPTS + 1):
-                    check_res = await deep_analyze_job(
-                        page, job["job_link"], content_tags
+            limits = httpx.Limits(
+                max_connections=STAGE_B_WORKERS,
+                max_keepalive_connections=STAGE_B_WORKERS,
+            )
+            async with httpx.AsyncClient(
+                timeout=STAGE_B_TIMEOUT, limits=limits
+            ) as client:
+                workers = [
+                    asyncio.create_task(
+                        _worker(in_queue, out_queue, client, content_tags)
                     )
-                    if check_res not in RETRYABLE_RESULTS:
-                        break
-                    if attempt < PER_JOB_MAX_ATTEMPTS:
-                        print(
-                            f"[Stage C] ⚠️ {check_res} → 第 {attempt} 次重試"
-                            f" (id={job['id']}),換 context 後再試"
-                        )
-                        await context.close()
-                        context = await _new_context(browser)
-                        page = await context.new_page()
-                        await asyncio.sleep(random.uniform(8, 15))
-                    else:
-                        print(
-                            f"[Stage C] ❌ {check_res} 重試 {PER_JOB_MAX_ATTEMPTS}"
-                            f" 次仍失敗 (id={job['id']}),記錄結果並繼續"
-                        )
-
-                if check_res in RETRYABLE_RESULTS:
-                    timeout_streak += 1
-                else:
-                    timeout_streak = 0
-
-                if timeout_streak >= 3:
-                    cooldown = random.uniform(300, 600)
-                    print(f"[Stage C] ⚠️ 連續多筆失敗，冷卻 {int(cooldown)}s 並更換指紋")
-                    await context.close()
-                    await asyncio.sleep(cooldown)
-                    context = await _new_context(browser)
-                    page = await context.new_page()
-                    timeout_streak = 0
-
-                if check_res == "404_ERROR":
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sql_closed = (
-                        "UPDATE vacancies SET status = 'closed', "
-                        "deleted_at = %s WHERE id = %s"
+                    for _ in range(STAGE_B_WORKERS)
+                ]
+                writer = asyncio.create_task(
+                    _writer(
+                        out_queue,
+                        cur,
+                        progress,
+                        expected_done=STAGE_B_WORKERS,
+                        total=total,
                     )
-                    await cur.execute(sql_closed, (now, job["id"]))
-                elif check_res:
-                    sql_upd = "UPDATE vacancies SET check_type = %s WHERE id = %s"
-                    await cur.execute(sql_upd, (check_res, job["id"]))
+                )
+                await asyncio.gather(*workers)
+                await writer
 
-                if idx % LONG_BREAK_EVERY == 0:
-                    await asyncio.sleep(random.uniform(20, 45))
-                else:
-                    await asyncio.sleep(random.uniform(3, 8))
-            await browser.close()
-    conn.close()
-    print("[Stage C] ✅ 完成。")
+            elapsed = time.time() - started
+            print("=" * 60)
+            print(
+                f"[Stage B] ✅ 完成 — 耗時 {elapsed:.1f}s({total/max(elapsed, 0.1):.1f} 筆/秒)"
+            )
+            print("=" * 60)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_content_scraper())
+    asyncio.run(
+        run_content_scraper(
+            keyword=os.getenv("DEFAULT_KEYWORD", "php"), content_tags=["php", "laravel"]
+        )
+    )

@@ -1,8 +1,10 @@
 # ADR-0002: 採用 Playwright 而非 requests + BeautifulSoup
 
-- **狀態**: Accepted
+- **狀態**: Partially Superseded by [ADR-0005](./0005-stage-bc-switch-to-104-api.md)(2026-05-11)
 - **日期**: 2026-04-22
 - **決策者**: Shane (SA / 開發者)
+
+> **更新註記(2026-05-11)**:本決策當初涵蓋三個 stage。實際運作後發現 104 對 Stage B(內文)/ Stage C(公司)有可匿名訪問的公開 JSON API,改用 `httpx` 直打後速度提升 10-30 倍。**Stage B / C 已 supersede 改用 API 模式**(見 [ADR-0005](./0005-stage-bc-switch-to-104-api.md));**Stage A(清單)仍維持 Playwright**,因為翻頁與職務類別 modal 互動依賴 JS 渲染,且還沒找到對應的搜尋 API。下文敘述對 Stage A 仍完整適用。
 
 ## Context — 我們在解決什麼問題?
 
@@ -103,9 +105,9 @@
 ## References
 
 - Code:
-  - `scraper_vacancies/main.py` — Stage A 用 Playwright
-  - `scpaper_company/main.py` — Stage C
-  - `scpaper_content/main.py` — Stage B
+  - `scraper_vacancies/main.py` — Stage A 用 Playwright(仍適用本 ADR)
+  - `scpaper_content/main.py` — Stage B(改 API,見 ADR-0005)
+  - `scpaper_company/main.py` — Stage C(改 API,見 ADR-0005)
 - 文件:
   - [`docs/sequence-diagrams.md` 第 1 節](../sequence-diagrams.md#1-stage-a-清單採集-producer-consumer) — Stage A 詳細流程
   - [`docs/sequence-diagrams.md` 第 5 節](../sequence-diagrams.md#5-反爬策略總覽) — 反爬手段彙整

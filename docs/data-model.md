@@ -144,10 +144,10 @@ CREATE TABLE vacancies (
 | `company_link` | Stage C 去重用(`SELECT DISTINCT company_link`)| Stage A |
 | `capital` / `employee_count` | default `'0'` / `''`,Stage C 補 | Stage C |
 | `keyword` | snapshot,不依賴 search_configs(萬一 Admin 刪了 search_config 還能查歷史) | Stage A |
-| `status` | enum,目前都是 `active`(`closed` 是 Roadmap:定期回 104 看職缺還在不在)| (預留) |
-| `check_type` | Stage B 寫,值如 `pass` / `keyword_mismatch` / `seniority_mismatch` | Stage B |
+| `status` | enum,Stage B 偵測到 API 回 404(職缺下架)時會改成 `closed` | Stage B(限 404 情況) |
+| `check_type` | Stage B 寫,值為 `工作內容有含關鍵字` / `加分條件或必要條件內有含關鍵字` / `僅有擅長工具含關鍵字,建議確認後再進行履歷投遞` / `no_match` 之一 | Stage B |
 | `created_at` / `updated_at` | UPSERT 時 updated_at 自動更新 | 自動 |
-| `deleted_at` | soft delete,目前**沒人寫**(Admin 不該寫,本系統也不想寫過時職缺直接刪) | (預留) |
+| `deleted_at` | soft delete,Stage B 偵測到 404 下架時與 status 一起寫入 | Stage B(限 404 情況) |
 
 **索引設計**
 
@@ -199,16 +199,13 @@ ON DUPLICATE KEY UPDATE
 ```
 [Stage A] INSERT vacancies (title, company, job_link, ...)
    capital='0', employee_count='', check_type=NULL, status='active'
+   (Playwright + Producer-Consumer 並發寫入)
    ↓
-[Stage B] UPDATE vacancies SET check_type = 'pass'/'keyword_mismatch'/...
+[Stage B] UPDATE vacancies SET check_type = '工作內容有含關鍵字' | '加分條件...' | '僅有擅長工具...' | 'no_match'
+   (httpx → /api/jobs/{no},N=5 並行,API 回 404 則改 status='closed' + deleted_at)
    ↓
-[Stage C] UPDATE vacancies SET capital = '5億', employee_count = '500人'
-   (但只更新 check_type='pass' 的職缺)
-   ↓
-(Roadmap) 排程定期 UPDATE vacancies SET status = 'closed'
-   WHERE 104 已經不存在
-   ↓
-(Roadmap) Admin 手動 UPDATE vacancies SET deleted_at = NOW() (軟刪)
+[Stage C] UPDATE vacancies SET capital = '5億元', employee_count = '500人'
+   (httpx → /api/companies/{no}/content,N=5 並行,GROUP BY company_link 去重)
 ```
 
 ### 6.2 一個 search_config 的生命線

@@ -1,8 +1,12 @@
-# ADR-0003: 三階段 pipeline(A→C→B)而非單階段
+# ADR-0003: 三階段 pipeline(A→B→C)而非單階段
 
 - **狀態**: Accepted
 - **日期**: 2026-04-22
 - **決策者**: Shane (SA / 開發者)
+
+> **命名更新註記(2026-05-10)**:本 ADR 早期版本曾將 stage 標籤寫為 A→C→B(C=內文、B=公司)。實際前端 admin 介面、`SearchConfig` 註解、過濾標籤介面皆已使用 A=清單 / B=內文 / C=公司 的順序,Python 端在 2026-05-10 對齊。下文已統一為 **A=清單採集、B=內文深度過濾、C=公司資料補全**。
+>
+> **架構更新註記(2026-05-11)**:Stage B / C 已從 Playwright 改為 104 公開 API(見 [ADR-0005](./0005-stage-bc-switch-to-104-api.md))。三階段 pipeline 結構本身**不變**,但 B/C 的實作手法不再是「打開瀏覽器頁面」,而是「打 JSON API」。
 
 ## Context — 我們在解決什麼問題?
 
@@ -14,15 +18,15 @@
 
 ## Decision — 我們選了什麼?
 
-**三階段 pipeline,順序刻意是 A → C → B**:
+**三階段 pipeline,順序刻意是 A → B → C**:
 
 ```
-Stage A — 清單採集
+Stage A — 清單採集 (Playwright)
   ↓ 寫 vacancies(只填 title/company/job_link/salary)
-Stage B — 內文深度過濾
-  ↓ 對每筆打開內文,標 check_type='pass' / 'mismatch'
-Stage C — 公司資料補全
-  ↓ 只對 check_type='pass' 的公司頁訪問,DISTINCT company_link 去重
+Stage B — 內文深度過濾 (104 API)
+  ↓ 對每筆打 API 取內文,標 check_type=分類字串 / 'no_match'
+Stage C — 公司資料補全 (104 API)
+  ↓ 對待補的公司打 API,DISTINCT company_link 去重
 ```
 
 每階段獨立 module,獨立可重跑,寫不同欄位。
@@ -43,12 +47,12 @@ for job in list:
 - ❌ **內文不通過的也浪費時間補公司資料**:Stage B 過濾掉 60% 的話,你白白多做 60% 的 Stage C
 - ❌ **Stage 不能重跑**:某筆職缺的內文 fail,整個逐筆迴圈都得重來
 
-### 選項 2 — A → B → C(先補公司,再過濾)
+### 選項 2 — A → C → B(先補公司,再過濾)
 
-- ✅ 同 A → C → B,但 B 在中間
-- ❌ **浪費資源**:對最後會被 C 過濾掉的職缺也補了公司資料
+- ✅ 也是三階段
+- ❌ **浪費資源**:對最後會被內文過濾掉的職缺也補了公司資料(白白多打 API)
 
-### 選項 3 — A → C → B (現選)
+### 選項 3 — A → B → C (現選)
 
 - ✅ **去重**:Stage C 的 DISTINCT company_link 大幅省訪問次數
 - ✅ **省 Stage C 時間**:只對 B 通過的職缺補公司資料,通常省 50-80%
@@ -65,7 +69,7 @@ for job in list:
 
 ### ✅ 正面
 
-- **效率高**:A 抓 1000 筆,C 過濾剩 400,B 對 80 家公司頁訪問。對比逐筆方案的 1000 + 1000 + 1000 = 3000 次頁面訪問,本方案是 1000 + 400 + 80 = 1480 次,**快 2 倍**
+- **效率高**:A 抓 1000 筆,B 過濾剩 400,C 對 80 家公司打 API。對比逐筆方案的 1000 + 1000 + 1000 = 3000 次訪問,本方案是 1000 + 400 + 80 = 1480 次,**訪問次數省一半**;加上 B/C 改用 API 後單次成本更低(見 ADR-0005),整體**速度提升一個量級以上**
 - **Resilient**:Stage A 寫進 DB 後,即使 C/B fail,資料不丟。下次跑 C 跑 B 時 SELECT 出未處理的繼續做
 - **Stage 解耦**:三個 module 在 `scraper_vacancies/` `scpaper_content/` `scpaper_company/`,可獨立改、獨立測試
 - **冪等**:每個 stage 都用 UPSERT 或 UPDATE WHERE status,重跑不會重複寫

@@ -18,7 +18,7 @@ flowchart TB
         subgraph compose["docker-compose"]
             direction TB
 
-            api_box["📦 job_digger_api<br/>job-digger-api:local<br/>python:3.11-slim<br/>Playwright + Chromium<br/>:85 → :8000"]
+            api_box["📦 job_digger_api<br/>job-digger-api:local<br/>python:3.11-slim<br/>Playwright + Chromium + httpx<br/>:85 → :8000"]
 
             db[("🗄 job_digger_db<br/>mariadb:latest<br/>:3308 → :3306<br/>volume: ./db_data")]
 
@@ -26,8 +26,8 @@ flowchart TB
         end
     end
 
-    site104["104.com.tw"]
-    api_box -- "Playwright Chromium" --> site104
+    site104["104.com.tw<br/>列表頁 + 公開 JSON API"]
+    api_box -- "Stage A: Playwright Chromium<br/>Stage B/C: httpx → /api/*" --> site104
 
     user -- "POST /api/scrape/{id}" --> api_box
     user -. "DBeaver / TablePlus" .-> db
@@ -53,8 +53,8 @@ flowchart TB
 | Base image | `python:3.11-slim` | [Dockerfile](../Dockerfile) |
 | Build size | ~1.5 GB(含 Chromium ~150 MB)| 第一次 build 5-10 分鐘 |
 | 系統依賴 | `wget` `gnupg` `curl`(Playwright 會自己裝 chromium 系統 deps) | Dockerfile |
-| Python 套件 | `fastapi` `uvicorn` `playwright` `playwright-stealth` `aiomysql` `python-dotenv` | requirements.txt |
-| Playwright 安裝 | `playwright install chromium && playwright install-deps chromium` | Dockerfile |
+| Python 套件 | `fastapi` `uvicorn` `playwright` `playwright-stealth` `httpx` `aiomysql` `python-dotenv` | requirements.txt |
+| Playwright 安裝 | `playwright install chromium && playwright install-deps chromium`(目前僅 Stage A 使用) | Dockerfile |
 | App 模組 | `app.py` + `scraper_vacancies/` + `scpaper_content/` + `scpaper_company/` + `data_transform/` | Dockerfile COPY |
 | Entry | `uvicorn app:app --host 0.0.0.0 --port 8000` | Dockerfile CMD |
 | Restart policy | `unless-stopped` | docker-compose |
@@ -85,7 +85,12 @@ flowchart TB
 | `DB_HOST` | (容器內)DB host | `job_db`(同 compose service name)|
 | `DB_PORT` | DB port | `3306`(容器內)|
 | `ALLOWED_ORIGINS` | CORS 白名單 | `http://localhost:84,http://127.0.0.1:84` |
-| `BROWSER_HEADLESS` | Playwright 無頭模式 | `True`(prod)/ `False`(dev 看畫面除錯)|
+| `BROWSER_HEADLESS` | Playwright 無頭模式(Stage A 用)| `True`(prod)/ `False`(dev 看畫面除錯)|
+| `USE_REAL_CHROME` | Stage A 是否用系統 Chrome 而非 bundled Chromium | `false`(容器內沒裝 Chrome) |
+| `BLOCK_RESOURCES` | Stage A 是否阻擋 image/font/media + 追蹤 domain(加速)| `true` |
+| `STAGE_B_WORKERS` / `STAGE_C_WORKERS` | Stage B/C 並行 worker 數 | `5` |
+| `STAGE_B_REQUEST_DELAY` / `STAGE_C_REQUEST_DELAY` | 每 worker 每次 request 後 sleep 秒數 | `0.3` |
+| `STAGE_B_TIMEOUT` / `STAGE_C_TIMEOUT` | 單次 API timeout 秒數 | `10` |
 | `DEFAULT_KEYWORD` | 沒指定時的 default | `php` |
 | `PYTHONUNBUFFERED` | print 即時刷出 | `1` |
 

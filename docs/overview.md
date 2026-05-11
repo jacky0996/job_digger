@@ -7,6 +7,8 @@
 ## 1. 系統定位 — 一句話
 
 > **Job Digger 是「104 職缺爬蟲服務」**:吃 keyword + title_tags + content_tags 進去,跑三階段 pipeline(清單 → 內文過濾 → 公司資料補全),把符合條件的職缺存進 MariaDB。提供 HTTP API 給 [Job Digger Admin](../../job_digger_admin) 觸發。
+>
+> **三 stage 的取資料手段不一樣**:Stage A(清單)用 Playwright 模擬瀏覽器;Stage B(內文)/ Stage C(公司)改打 104 公開 JSON API(見 [ADR-0005](./adr/0005-stage-bc-switch-to-104-api.md)),速度提升一個量級。
 
 它**不**做的事:不渲染 UI、不對 End User 開放、不處理身分驗證(Admin 才管那些)。本系統純粹是 **「爬蟲 service + DB owner」**。
 
@@ -24,20 +26,29 @@ flowchart LR
 
     subgraph digger["Job Digger (本專案)"]
         api["FastAPI :85"]
-        scrapers["3-stage scrapers<br/>(Stage A/B/C)"]
+        sa["Stage A: 清單 (Playwright)"]
+        sb["Stage B: 內文 (104 API)"]
+        sc["Stage C: 公司 (104 API)"]
         db[("MariaDB :3308<br/>(共用)")]
-        api --> scrapers
-        scrapers --> db
+        api --> sa
+        api --> sb
+        api --> sc
+        sa --> db
+        sb --> db
+        sc --> db
         ui --> db
     end
 
     subgraph external["External"]
-        site104["104.com.tw"]
+        site104_page["104 列表頁 (SPA)"]
+        site104_api["104 公開 JSON API<br/>/api/jobs/* · /api/companies/*"]
     end
 
     actor_admin --> ui
-    ui -. "(Roadmap) POST /api/scrape/{id}" .-> api
-    scrapers -- "Playwright Chromium" --> site104
+    ui -. "POST /api/scrape/{id}" .-> api
+    sa -- "Playwright Chromium" --> site104_page
+    sb -- "httpx" --> site104_api
+    sc -- "httpx" --> site104_api
 ```
 
 **關鍵設計**
@@ -55,18 +66,18 @@ flowchart LR
 |---|---|---|
 | **搜尋配置 (SearchConfig)** | `search_configs` 表 | Admin 設的爬蟲關鍵字 + 過濾標籤 |
 | **職缺 (Vacancy)** | `vacancies` 表 | 爬回的 104 職缺,含薪資 / 公司 / 連結 |
-| **三階段 Pipeline** | `scraper_vacancies` / `scpaper_content` / `scpaper_company` | A:抓清單 → C:內文過濾 → B:公司補資料 |
+| **三階段 Pipeline** | `scraper_vacancies` / `scpaper_content` / `scpaper_company` | A:抓清單(Playwright)→ B:內文比對(API)→ C:公司補資料(API)|
 
 業務流程:
 ```
-Admin 在 UI 設 keyword="PHP", title_tags="php,後端"
+Admin 在 UI 設 keyword="PHP", title_tags="php,後端", content_tags="php,laravel"
   ↓
 (觸發) POST /api/scrape/1
   ↓
 本系統背景跑:
-  Stage A — 開 Chromium 進 104,搜 "PHP",抓所有清單頁
-  Stage B — 對清單職缺打開內文,過濾掉標題沒含 "php" / "後端" 的
-  Stage C — 對通過 B 的職缺,點公司頁補資本額 / 員工數
+  Stage A — 開 Chromium 進 104,搜 "PHP",抓所有清單頁(Playwright)
+  Stage B — 對每筆打 /api/jobs/{no},比對 content_tags 寫 check_type
+  Stage C — 對待補公司打 /api/companies/{no}/content,補資本額 / 員工數
   寫進 vacancies 表(UPSERT by job_link)
   ↓
 Admin 在 /vacancies/search 看結果
@@ -78,9 +89,9 @@ Admin 在 /vacancies/search 看結果
 
 ### ✅ In Scope
 
-- **104 爬蟲**:Playwright + Chromium 模擬瀏覽器,處理 JS 渲染
+- **104 資料採集**:Stage A 用 Playwright + Chromium 處理列表 SPA;Stage B/C 用 httpx 直打 104 公開 JSON API
 - **三階段 pipeline**:list → content filter → company info
-- **生產者-消費者**:`asyncio.Queue` + 多 worker 解耦
+- **多種並發模型**:Stage A 用 `asyncio.Queue` Producer-Consumer;Stage B/C 用 Producer/Worker/Writer + N=5 並行 worker
 - **UPSERT 寫入**:`ON DUPLICATE KEY UPDATE job_link`,重跑爬蟲不會重複插入
 - **HTTP API**:`POST /api/scrape/{id}` 觸發 + `GET /api/scrape/status/{id}` 查狀態 + `GET /health`
 - **DB schema 維護**:`init.sql` 啟動時建 `vacancies` / `search_configs`
@@ -125,10 +136,10 @@ Admin 在 /vacancies/search 看結果
 
 | 類別 | 目標 | 設計回應 |
 |---|---|---|
-| **吞吐** | 一個 keyword 1k+ 職缺能在 30 分鐘內跑完 | 三階段並行 + 多 worker(Stage A producer,Stage B/C consumer) |
-| **記憶體** | 單機 < 2GB(含 Chromium) | Chromium 用完即關,結果寫 DB 不留 in-memory list |
+| **吞吐** | 一個 keyword 1k+ 職缺能在 30 分鐘內跑完 | Stage A 用 Producer-Consumer 並發抓清單;Stage B/C 改 API + N=5 並行 worker |
+| **記憶體** | 單機 < 1GB(只 Stage A 用 Chromium) | Chromium 用完即關;Stage B/C 純 httpx 不留 in-memory list |
 | **DB 寫入安全** | 重跑不重複 | UPSERT (ON DUPLICATE KEY UPDATE job_link) |
-| **反爬** | 不被 104 ban | Playwright stealth plugin + 模擬人類點擊 + 跳轉「探測末頁」hack 而不是 brute-force |
+| **反爬** | 不被 104 ban | Stage A:Playwright stealth + 末頁探測 hack;Stage B/C:API 端不觸發 CF,但 worker 間 sleep 0.3s 避免 IP 流量集中 |
 | **故障隔離** | 一次爬失敗不影響後續 | active_tasks set 追蹤,完成 / 失敗都會 discard;BackgroundTasks 拋例外只記 log 不傳染 |
 
 ---
@@ -137,7 +148,7 @@ Admin 在 /vacancies/search 看結果
 
 | 術語 | 中文 | 說明 |
 |---|---|---|
-| **Stage A / B / C** | 三階段 | A=清單採集,B=公司資訊補全,C=內文深度過濾 |
+| **Stage A / B / C** | 三階段 | A=清單採集(Playwright)、B=內文深度過濾(API)、C=公司資訊補全(API)|
 | **Producer-Consumer** | 生產者-消費者 | Producer 抓網頁、Consumer 寫 DB,中間用 `asyncio.Queue` 緩衝 |
 | **錨點回溯法** | — | 從 `.info-job__text` 元素往上找最近的職缺卡片容器,而非 hardcode XPath |
 | **末頁探測 hack** | — | 在跳轉欄位輸入「9999」讓 104 顯示真實末頁,避免 brute-force 翻頁 |
