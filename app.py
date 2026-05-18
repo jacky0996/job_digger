@@ -6,7 +6,9 @@ import aiomysql
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
+from llm_suggest import LlmSuggestError, suggest_search_config
 from scpaper_company.main import run_company_scraper
 from scpaper_content.main import run_content_scraper
 
@@ -283,6 +285,23 @@ async def get_scrape_status(config_id: int):
     直到下次同 id 觸發時被覆蓋。
     """
     return _build_status(config_id, active_tasks.get(config_id))
+
+
+class SuggestConfigRequest(BaseModel):
+    intent: str = Field(..., min_length=5, max_length=500)
+
+
+@app.post("/api/llm/suggest-config")
+async def llm_suggest_config(req: SuggestConfigRequest):
+    """LLM 助手:把自然語言意圖翻譯成 (keyword, title_tags, content_tags, reasoning)。
+
+    給 admin 新增關鍵字頁面用,使用者不知道怎麼下關鍵字時觸發。
+    failure:LlmSuggestError → 503(讓前端顯示「AI 暫時無法回應」)。
+    """
+    try:
+        return await suggest_search_config(req.intent)
+    except LlmSuggestError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @app.get("/health")

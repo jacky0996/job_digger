@@ -4,6 +4,7 @@ playwright
 python-dotenv
 aiomysql
 httpx
+google-genai
 # Testing & Linting
 pytest
 pytest-asyncio

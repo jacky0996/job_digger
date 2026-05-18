@@ -17,8 +17,9 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 # 2. 裝 Playwright Chromium + 它的系統函式庫(~150MB)
 RUN playwright install chromium && playwright install-deps chromium
 
-# 3. 複製整個專案(app.py + 各 scraper 模組 + data_transform)
+# 3. 複製整個專案(app.py + 各 scraper 模組 + data_transform + llm 助手)
 COPY app.py ./
+COPY llm_suggest.py ./
 COPY scpaper_company ./scpaper_company
 COPY scpaper_content ./scpaper_content
 COPY scraper_vacancies ./scraper_vacancies
