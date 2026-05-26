@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -29,6 +30,43 @@ class _SuppressStatusPollingFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_SuppressStatusPollingFilter())
 
 app = FastAPI(title="Job Digger API Service")
+
+logger = logging.getLogger("job_digger")
+
+
+@app.on_event("startup")
+async def run_init_sql():
+    """容器啟動時把 init.sql 跑進 DB(類似 Laravel migrate)。
+
+    所有 statements 都 idempotent(CREATE TABLE IF NOT EXISTS / DROP TRIGGER IF EXISTS
+    / ON CONFLICT 等),每次 cold start 跑都安全。
+
+    Cloud Run 偶爾會 cold start 撞到 Cloud SQL socket 還沒 ready,
+    做輕量 retry 後仍失敗就 log 並放行(不阻擋 app 啟動,讓 readiness 失敗自動 restart)。
+    """
+    sql_path = os.path.join(os.path.dirname(__file__), "init.sql")
+    if not os.path.exists(sql_path):
+        logger.warning("init.sql not found at %s, skip migrate", sql_path)
+        return
+
+    with open(sql_path, "r", encoding="utf-8") as f:
+        ddl = f.read()
+
+    for attempt in range(1, 6):
+        try:
+            conn = await get_db_conn()
+            try:
+                await conn.execute(ddl)
+                logger.info("init.sql applied successfully (attempt %d)", attempt)
+                return
+            finally:
+                await conn.close()
+        except Exception as exc:
+            logger.warning("init.sql apply failed (attempt %d/5): %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+
+    logger.error("init.sql failed after 5 attempts — app will start anyway")
+
 
 # CORS：僅允許 job_digger_admin 與本機開發 origin
 # (正式環境請覆寫 ALLOWED_ORIGINS env var,以逗號分隔)

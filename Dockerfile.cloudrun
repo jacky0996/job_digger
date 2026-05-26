@@ -32,6 +32,7 @@ RUN playwright install chromium && playwright install-deps chromium
 # 3. 應用程式碼
 COPY app.py ./
 COPY llm_suggest.py ./
+COPY init.sql ./
 COPY scpaper_company ./scpaper_company
 COPY scpaper_content ./scpaper_content
 COPY scraper_vacancies ./scraper_vacancies
