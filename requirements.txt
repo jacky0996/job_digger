@@ -2,7 +2,7 @@ fastapi
 uvicorn
 playwright
 python-dotenv
-aiomysql
+asyncpg
 httpx
 google-genai
 # Testing & Linting

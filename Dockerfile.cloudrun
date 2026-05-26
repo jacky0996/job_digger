@@ -1,0 +1,44 @@
+# Cloud Run 用 image。
+# 跟 dev Dockerfile 差別:
+#   1. CMD 用 sh -c 讀 $PORT(Cloud Run 注入 PORT=8080,不能 hardcode)
+#   2. 不開 EXPOSE 8000(Cloud Run 看 $PORT)
+#   3. Playwright headless,無 X server
+
+FROM python:3.11-slim
+
+ENV TZ=Asia/Taipei \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    BROWSER_HEADLESS=true \
+    USE_REAL_CHROME=false
+
+# Playwright Chromium 需要的系統 deps + 一般工具
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    gnupg \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 1. 先裝 Python 套件
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+
+# 2. 裝 Playwright Chromium + 系統 deps(~150MB)
+RUN playwright install chromium && playwright install-deps chromium
+
+# 3. 應用程式碼
+COPY app.py ./
+COPY llm_suggest.py ./
+COPY scpaper_company ./scpaper_company
+COPY scpaper_content ./scpaper_content
+COPY scraper_vacancies ./scraper_vacancies
+COPY data_transform ./data_transform
+
+# Cloud Run 注入 PORT(預設 8080)
+ENV PORT=8080
+
+# 用 sh -c 才能展 $PORT;exec 形式 shell 不會展
+CMD exec uvicorn app:app --host 0.0.0.0 --port ${PORT}

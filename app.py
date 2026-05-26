@@ -2,7 +2,7 @@ import logging
 import os
 import time
 
-import aiomysql
+import asyncpg
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -107,15 +107,14 @@ def _build_status(config_id: int, p: dict | None) -> dict:
 
 
 async def get_db_conn():
-    return await aiomysql.connect(
+    # asyncpg 預設 autocommit;session timezone 透過 server_settings 設定
+    return await asyncpg.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
-        port=int(os.getenv("DB_PORT", 3308)),
+        port=int(os.getenv("DB_PORT", 5434)),
         user=os.getenv("DB_USERNAME"),
         password=os.getenv("DB_PASSWORD"),
-        db=os.getenv("DB_DATABASE"),
-        charset="utf8mb4",
-        autocommit=True,
-        init_command="SET time_zone = '+08:00'",
+        database=os.getenv("DB_DATABASE"),
+        server_settings={"timezone": "+08:00"},
     )
 
 
@@ -141,34 +140,31 @@ async def start_scraping_task(config_id: int):
     active_tasks[config_id] = progress
 
     conn = await get_db_conn()
-    async with conn.cursor(aiomysql.DictCursor) as cur:
-        await cur.execute(
-            "SELECT keyword, title_tags, content_tags "
-            "FROM search_configs WHERE id = %s",
-            (config_id,),
-        )
-        config = await cur.fetchone()
+    config = await conn.fetchrow(
+        "SELECT keyword, title_tags, content_tags " "FROM search_configs WHERE id = $1",
+        config_id,
+    )
 
-        if not config:
-            print(f"❌ 找不到配置 ID: {config_id}，任務終止。")
-            progress["stage"] = "failed"
-            progress["error"] = f"找不到 config_id={config_id}"
-            progress["finished_at"] = time.time()
-            conn.close()
-            return
+    if not config:
+        print(f"❌ 找不到配置 ID: {config_id}，任務終止。")
+        progress["stage"] = "failed"
+        progress["error"] = f"找不到 config_id={config_id}"
+        progress["finished_at"] = time.time()
+        await conn.close()
+        return
 
-        keyword = config["keyword"]
-        title_tags = [
-            t.strip() for t in (config["title_tags"] or "").split(",") if t.strip()
-        ]
-        content_tags = [
-            t.strip() for t in (config["content_tags"] or "").split(",") if t.strip()
-        ]
-        progress["keyword"] = keyword
-        print(
-            f"取得配置: keyword='{keyword}', "
-            f"title_tags={title_tags}, content_tags={content_tags}"
-        )
+    keyword = config["keyword"]
+    title_tags = [
+        t.strip() for t in (config["title_tags"] or "").split(",") if t.strip()
+    ]
+    content_tags = [
+        t.strip() for t in (config["content_tags"] or "").split(",") if t.strip()
+    ]
+    progress["keyword"] = keyword
+    print(
+        f"取得配置: keyword='{keyword}', "
+        f"title_tags={title_tags}, content_tags={content_tags}"
+    )
 
     # 執行流程 — 各 scraper 透過 progress dict 回報進度
     try:
@@ -192,11 +188,10 @@ async def start_scraping_task(config_id: int):
         await run_company_scraper(keyword=keyword, progress=progress)
 
         progress["stage"] = "done"
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE search_configs SET last_scraped_at = NOW() WHERE id = %s",
-                (config_id,),
-            )
+        await conn.execute(
+            "UPDATE search_configs SET last_scraped_at = NOW() WHERE id = $1",
+            config_id,
+        )
         print(f"\n--- ✅ 任務完成 (ID: {config_id}) ---")
     except Exception as e:
         progress["stage"] = "failed"
@@ -204,7 +199,7 @@ async def start_scraping_task(config_id: int):
         print(f"❌ 任務執行過程中發生異常: {e}")
     finally:
         progress["finished_at"] = time.time()
-        conn.close()
+        await conn.close()
 
 
 async def _validate_and_start(
@@ -215,32 +210,29 @@ async def _validate_and_start(
 ):
     """共用守衛流程。require_today=True 給使用者觸發用,False 給排程繞過今日限制。"""
     conn = await get_db_conn()
-    async with conn.cursor() as cur:
-        await cur.execute("SET time_zone = '+08:00'")
+    try:
         if require_today:
-            await cur.execute(
-                "SELECT id, DATE(created_at) = CURDATE() AS is_today "
-                "FROM search_configs WHERE id = %s",
-                (config_id,),
+            # PG 用 CURRENT_DATE 取代 MySQL 的 CURDATE()
+            row = await conn.fetchrow(
+                "SELECT id, (DATE(created_at) = CURRENT_DATE) AS is_today "
+                "FROM search_configs WHERE id = $1",
+                config_id,
             )
-            row = await cur.fetchone()
             if not row:
-                conn.close()
                 raise HTTPException(status_code=404, detail="Config ID not found")
-            if not row[1]:
-                conn.close()
+            if not row["is_today"]:
                 raise HTTPException(
                     status_code=403,
                     detail="此關鍵字非今日建立,將由排程自動執行,無法手動觸發",
                 )
         else:
-            await cur.execute(
-                "SELECT id FROM search_configs WHERE id = %s", (config_id,)
+            row = await conn.fetchrow(
+                "SELECT id FROM search_configs WHERE id = $1", config_id
             )
-            if not await cur.fetchone():
-                conn.close()
+            if not row:
                 raise HTTPException(status_code=404, detail="Config ID not found")
-    conn.close()
+    finally:
+        await conn.close()
 
     if _is_running(active_tasks.get(config_id)):
         raise HTTPException(status_code=400, detail="此關鍵字的抓取任務已在執行中")

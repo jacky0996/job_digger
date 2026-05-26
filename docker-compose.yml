@@ -18,7 +18,7 @@ services:
       - PYTHONUNBUFFERED=1
       # DB 連線:從容器內走 service name(同 compose network)
       - DB_HOST=job_db
-      - DB_PORT=3306
+      - DB_PORT=5432
       # CORS 白名單:允許 admin 後台
       # (admin 用 8084 而非 84 — 84 被 macOS / Docker Desktop reserve)
       - ALLOWED_ORIGINS=http://localhost:8084,http://127.0.0.1:8084
@@ -27,19 +27,28 @@ services:
       # 容器只裝 bundled Chromium (沒裝 Google Chrome),不能用 channel="chrome"
       - USE_REAL_CHROME=false
     depends_on:
-      - job_db
+      job_db:
+        condition: service_healthy
     restart: unless-stopped
   job_db:
-    image: mariadb:latest
+    image: postgres:16
     container_name: job_digger_db
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${DB_DATABASE}
-      MYSQL_USER: ${DB_USERNAME}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_DATABASE}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Taipei
+      PGTZ: Asia/Taipei
     ports:
-      - "3308:3306"
+      # host 5434 → container 5432
+      # (5432 留中台 Middle_Platform,5433 留 edm_backend)
+      - "5434:5432"
     volumes:
-      - ./db_data:/var/lib/mysql
+      - ./db_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

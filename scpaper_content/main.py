@@ -22,7 +22,7 @@ import re
 import time
 from datetime import datetime
 
-import aiomysql
+import asyncpg
 import httpx
 from dotenv import load_dotenv
 
@@ -192,7 +192,7 @@ _STATS_LABEL_SHORT = {
 
 async def _writer(
     out_queue: asyncio.Queue,
-    cur,
+    conn,
     progress: dict | None,
     expected_done: int,
     total: int,
@@ -217,10 +217,11 @@ async def _writer(
         try:
             if item["kind"] == "closed":
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                await cur.execute(
-                    "UPDATE vacancies SET status = 'closed', deleted_at = %s "
-                    "WHERE id = %s",
-                    (now, item["id"]),
+                await conn.execute(
+                    "UPDATE vacancies SET status = 'closed', deleted_at = $1 "
+                    "WHERE id = $2",
+                    now,
+                    item["id"],
                 )
                 processed += 1
                 counts["closed"] += 1
@@ -229,9 +230,10 @@ async def _writer(
                     f"id={item['id']} ({item['title']})"
                 )
             else:
-                await cur.execute(
-                    "UPDATE vacancies SET check_type = %s WHERE id = %s",
-                    (item["check_type"], item["id"]),
+                await conn.execute(
+                    "UPDATE vacancies SET check_type = $1 WHERE id = $2",
+                    item["check_type"],
+                    item["id"],
                 )
                 processed += 1
                 short = _STATS_LABEL_SHORT.get(item["check_type"], item["check_type"])
@@ -267,88 +269,80 @@ async def run_content_scraper(keyword, content_tags, progress=None):
     kw = keyword
 
     try:
-        conn = await aiomysql.connect(
+        conn = await asyncpg.connect(
             host=os.getenv("DB_HOST", "127.0.0.1"),
-            port=int(os.getenv("DB_PORT", 3308)),
+            port=int(os.getenv("DB_PORT", 5434)),
             user=os.getenv("DB_USERNAME"),
             password=os.getenv("DB_PASSWORD"),
-            db=os.getenv("DB_DATABASE"),
-            charset="utf8mb4",
-            autocommit=True,
-            init_command="SET time_zone = '+08:00'",
+            database=os.getenv("DB_DATABASE"),
+            server_settings={"timezone": "+08:00"},
         )
     except Exception as e:
         print(f"[Stage B] ❌ 資料庫連線失敗: {e}")
         return
 
     try:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            # 增量爬取:沒處理過,或上次偵測逾時的(沿用舊邏輯)
-            sql = (
-                "SELECT id, job_link, title FROM vacancies "
-                "WHERE status = 'active' AND keyword = %s "
-                "AND (check_type IS NULL OR check_type = '偵測逾時，建議手動確認')"
-            )
-            await cur.execute(sql, (kw,))
-            jobs = await cur.fetchall()
+        # 增量爬取:沒處理過,或上次偵測逾時的(沿用舊邏輯)
+        jobs = await conn.fetch(
+            "SELECT id, job_link, title FROM vacancies "
+            "WHERE status = 'active' AND keyword = $1 "
+            "AND (check_type IS NULL OR check_type = '偵測逾時，建議手動確認')",
+            kw,
+        )
 
-            if not jobs:
-                print(f"[Stage B] 🎉 '{kw}' 內文資料都已處理完畢")
-                return
+        if not jobs:
+            print(f"[Stage B] 🎉 '{kw}' 內文資料都已處理完畢")
+            return
 
-            total = len(jobs)
-            started = time.time()
-            print("=" * 60)
-            print("[Stage B] 🚀 內文比對啟動")
-            print(f"          keyword: {kw}")
-            print(f"          tags:    {content_tags}")
-            print(f"          待檢查:  {total} 筆")
-            print(f"          workers: {STAGE_B_WORKERS}")
-            print("=" * 60)
-            if progress is not None:
-                progress["total"] = total
+        total = len(jobs)
+        started = time.time()
+        print("=" * 60)
+        print("[Stage B] 🚀 內文比對啟動")
+        print(f"          keyword: {kw}")
+        print(f"          tags:    {content_tags}")
+        print(f"          待檢查:  {total} 筆")
+        print(f"          workers: {STAGE_B_WORKERS}")
+        print("=" * 60)
+        if progress is not None:
+            progress["total"] = total
 
-            in_queue: asyncio.Queue = asyncio.Queue()
-            out_queue: asyncio.Queue = asyncio.Queue()
+        in_queue: asyncio.Queue = asyncio.Queue()
+        out_queue: asyncio.Queue = asyncio.Queue()
 
-            for j in jobs:
-                await in_queue.put(j)
-            for _ in range(STAGE_B_WORKERS):
-                await in_queue.put(_WORKER_DONE)
+        for j in jobs:
+            await in_queue.put(j)
+        for _ in range(STAGE_B_WORKERS):
+            await in_queue.put(_WORKER_DONE)
 
-            limits = httpx.Limits(
-                max_connections=STAGE_B_WORKERS,
-                max_keepalive_connections=STAGE_B_WORKERS,
-            )
-            async with httpx.AsyncClient(
-                timeout=STAGE_B_TIMEOUT, limits=limits
-            ) as client:
-                workers = [
-                    asyncio.create_task(
-                        _worker(in_queue, out_queue, client, content_tags)
-                    )
-                    for _ in range(STAGE_B_WORKERS)
-                ]
-                writer = asyncio.create_task(
-                    _writer(
-                        out_queue,
-                        cur,
-                        progress,
-                        expected_done=STAGE_B_WORKERS,
-                        total=total,
-                    )
+        limits = httpx.Limits(
+            max_connections=STAGE_B_WORKERS,
+            max_keepalive_connections=STAGE_B_WORKERS,
+        )
+        async with httpx.AsyncClient(timeout=STAGE_B_TIMEOUT, limits=limits) as client:
+            workers = [
+                asyncio.create_task(_worker(in_queue, out_queue, client, content_tags))
+                for _ in range(STAGE_B_WORKERS)
+            ]
+            writer = asyncio.create_task(
+                _writer(
+                    out_queue,
+                    conn,
+                    progress,
+                    expected_done=STAGE_B_WORKERS,
+                    total=total,
                 )
-                await asyncio.gather(*workers)
-                await writer
-
-            elapsed = time.time() - started
-            print("=" * 60)
-            print(
-                f"[Stage B] ✅ 完成 — 耗時 {elapsed:.1f}s({total/max(elapsed, 0.1):.1f} 筆/秒)"
             )
-            print("=" * 60)
+            await asyncio.gather(*workers)
+            await writer
+
+        elapsed = time.time() - started
+        print("=" * 60)
+        print(
+            f"[Stage B] ✅ 完成 — 耗時 {elapsed:.1f}s({total/max(elapsed, 0.1):.1f} 筆/秒)"
+        )
+        print("=" * 60)
     finally:
-        conn.close()
+        await conn.close()
 
 
 if __name__ == "__main__":

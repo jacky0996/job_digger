@@ -130,9 +130,26 @@ def _get_client() -> genai.Client:
     if _client is not None:
         return _client
 
+    # Prod (Cloud Run) 走 Vertex AI:用 runtime service account ADC,免 API key。
+    # Local 開發保留 GEMINI_API_KEY fallback,免裝 gcloud。
+    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if use_vertex:
+        project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+        location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1").strip()
+        if not project:
+            raise LlmSuggestError("Vertex 模式需設定 GOOGLE_CLOUD_PROJECT")
+        _client = genai.Client(vertexai=True, project=project, location=location)
+        return _client
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise LlmSuggestError("未設定 GEMINI_API_KEY")
+        raise LlmSuggestError(
+            "未設定 GEMINI_API_KEY(或改設 GOOGLE_GENAI_USE_VERTEXAI=true 走 Vertex)"
+        )
 
     _client = genai.Client(api_key=api_key)
     return _client

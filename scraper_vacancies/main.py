@@ -3,7 +3,7 @@ import os
 import random
 import re
 
-import aiomysql
+import asyncpg
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
@@ -194,24 +194,22 @@ async def producer(page, total_pages, keyword, queue, title_tags, progress=None)
 
 async def consumer(queue):
     """
-    消費者：負責將資料寫入 MariaDB
+    消費者：負責將資料寫入 PostgreSQL
     """
     try:
-        conn = await aiomysql.connect(
+        conn = await asyncpg.connect(
             host=os.getenv("DB_HOST", "127.0.0.1"),
-            port=int(os.getenv("DB_PORT", 3308)),
+            port=int(os.getenv("DB_PORT", 5434)),
             user=os.getenv("DB_USERNAME"),
             password=os.getenv("DB_PASSWORD"),
-            db=os.getenv("DB_DATABASE"),
-            charset="utf8mb4",
-            autocommit=True,
-            init_command="SET time_zone = '+08:00'",
+            database=os.getenv("DB_DATABASE"),
+            server_settings={"timezone": "+08:00"},
         )
     except Exception as e:
         print(f"[Consumer] ❌ 連線失敗: {e}")
         return
 
-    async with conn.cursor() as cur:
+    try:
         while True:
             data = await queue.get()
             if data is None:
@@ -219,14 +217,17 @@ async def consumer(queue):
                 break
 
             try:
+                # PG 用 ON CONFLICT 取代 MySQL 的 ON DUPLICATE KEY UPDATE
+                # job_link 上有 UNIQUE 約束(uk_job_link),衝突時把 status 拉回 active
                 sql = """
                 INSERT INTO vacancies
                 (title, company_name, company_link, job_link,
                  salary_text, keyword, status)
-                VALUES (%s, %s, %s, %s, %s, %s, 'active')
-                ON DUPLICATE KEY UPDATE status = 'active'
+                VALUES ($1, $2, $3, $4, $5, $6, 'active')
+                ON CONFLICT (job_link) DO UPDATE SET status = 'active'
                 """
-                args = (
+                await conn.execute(
+                    sql,
                     data["title"],
                     data["company_name"],
                     data["company_link"],
@@ -234,11 +235,11 @@ async def consumer(queue):
                     data["salary_text"],
                     data["keyword"],
                 )
-                await cur.execute(sql, args)
             except Exception as e:
                 print(f"[Consumer] 寫入失敗: {e}")
             queue.task_done()
-    conn.close()
+    finally:
+        await conn.close()
 
 
 async def run_list_scraper(keyword=None, title_tags=None, progress=None):
