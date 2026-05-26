@@ -45,8 +45,9 @@ async def run_init_sql():
     做輕量 retry 後仍失敗就 log 並放行(不阻擋 app 啟動,讓 readiness 失敗自動 restart)。
     """
     sql_path = os.path.join(os.path.dirname(__file__), "init.sql")
+    print(f"[startup] run_init_sql: looking for {sql_path}", flush=True)
     if not os.path.exists(sql_path):
-        logger.warning("init.sql not found at %s, skip migrate", sql_path)
+        print(f"[startup] init.sql not found at {sql_path}, skip migrate", flush=True)
         return
 
     with open(sql_path, "r", encoding="utf-8") as f:
@@ -57,15 +58,23 @@ async def run_init_sql():
             conn = await get_db_conn()
             try:
                 await conn.execute(ddl)
-                logger.info("init.sql applied successfully (attempt %d)", attempt)
+                print(
+                    f"[startup] init.sql applied successfully (attempt {attempt})",
+                    flush=True,
+                )
                 return
             finally:
                 await conn.close()
         except Exception as exc:
-            logger.warning("init.sql apply failed (attempt %d/5): %s", attempt, exc)
+            print(
+                f"[startup] init.sql apply failed (attempt {attempt}/5): {exc}",
+                flush=True,
+            )
             await asyncio.sleep(2 * attempt)
 
-    logger.error("init.sql failed after 5 attempts — app will start anyway")
+    print(
+        "[startup] init.sql failed after 5 attempts — app will start anyway", flush=True
+    )
 
 
 # CORS：僅允許 job_digger_admin 與本機開發 origin
