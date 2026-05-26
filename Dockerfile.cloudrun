@@ -35,7 +35,6 @@ COPY llm_suggest.py ./
 COPY scpaper_company ./scpaper_company
 COPY scpaper_content ./scpaper_content
 COPY scraper_vacancies ./scraper_vacancies
-COPY data_transform ./data_transform
 
 # Cloud Run 注入 PORT(預設 8080)
 ENV PORT=8080
